@@ -77,8 +77,24 @@ jobs:
       # A repository VARIABLE rather than a secret, so the mode is visible.
       TRADING_MODE: ${{ vars.TRADING_MODE || 'paper' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
+      # Binance's main API returns HTTP 451 from many cloud IP ranges, and
+      # GitHub's runners are Azure-hosted, so ingest can fail here even though
+      # it works locally. Leave these unset to use the default hosts; set
+      # BINANCE_BASE_URL to https://data-api.binance.vision (with
+      # BINANCE_USE_FUTURES=false, since the mirror is spot-only) if the
+      # "Check the market data host is reachable" step below fails.
+      # An unset variable arrives as an empty string, which the settings layer
+      # treats as "use the default".
+      BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL }}
+      BINANCE_USE_FUTURES: ${{ vars.BINANCE_USE_FUTURES || 'true' }}
       CONFIG_DIR: ${{ github.workspace }}/config
-      CACHE_DIR: ${{ runner.temp }}/tradingbot-cache
+      # A literal path, not ${{ runner.temp }}. The `runner` context does not
+      # exist in a job-level env block - only github, vars, secrets, needs,
+      # strategy, matrix and inputs do - and referencing it there makes the
+      # whole workflow file invalid, so every run fails at startup before a
+      # single step executes. The job pins runs-on: ubuntu-latest, so /tmp is
+      # guaranteed to exist and be writable.
+      CACHE_DIR: /tmp/tradingbot-cache
       GIT_SHA: ${{ github.sha }}
       PYTHONUNBUFFERED: "1"
 
@@ -102,6 +118,32 @@ jobs:
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::DATABASE_URL secret is not set. Add the POOLED Neon connection string (the host containing '-pooler')."
             exit 1
+          fi
+
+      # Diagnoses the one failure that is environment-specific and otherwise
+      # looks like a bug: Binance geo-blocks many cloud IPs with HTTP 451, so
+      # ingest can fail on a runner while working perfectly on a laptop. This
+      # prints the verdict instead of leaving you to infer it from a stack
+      # trace. Never fails the job.
+      - name: Check the market data host is reachable
+        continue-on-error: true
+        run: |
+          HOST="${BINANCE_BASE_URL:-https://fapi.binance.com}"
+          if [ "${BINANCE_USE_FUTURES}" = "false" ] && [ -z "${BINANCE_BASE_URL}" ]; then
+            HOST="https://api.binance.com"
+          fi
+          case "$HOST" in
+            *binance.vision) PATHPART="/api/v3/klines" ;;
+            *fapi.binance.com) PATHPART="/fapi/v1/klines" ;;
+            *) PATHPART="/api/v3/klines" ;;
+          esac
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${HOST}${PATHPART}?symbol=BTCUSDT&interval=4h&limit=1" || echo "000")
+          echo "GET ${HOST}${PATHPART} -> HTTP ${CODE}"
+          if [ "$CODE" = "451" ]; then
+            echo "::warning::Binance returns 451 (restricted location) from this runner. Set repository variables BINANCE_BASE_URL=https://data-api.binance.vision and BINANCE_USE_FUTURES=false."
+          elif [ "$CODE" != "200" ]; then
+            echo "::warning::Market data host returned HTTP ${CODE}; ingest will likely fail."
           fi
 
       # Decide which job this invocation is. A scheduled run carries the cron
