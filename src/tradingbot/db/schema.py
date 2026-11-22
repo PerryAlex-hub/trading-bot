@@ -52,6 +52,12 @@ PCT = Numeric(12, 6)
 # database server. Tests that need real behaviour run against Postgres in CI.
 JSON_TYPE = JSONB().with_variant(JSON(), "sqlite")
 
+# SQLite only auto-increments a column declared exactly INTEGER PRIMARY KEY; a
+# BIGINT one raises "NOT NULL constraint failed". Postgres has no such quirk and
+# BIGINT is the right choice there for the candle table. The variant keeps the
+# whole test suite runnable on in-memory SQLite without a database server.
+PK = BigInteger().with_variant(Integer, "sqlite")
+
 
 def utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
@@ -84,7 +90,7 @@ class Candle(Base):
 
     __tablename__ = "candles"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
     open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -120,7 +126,7 @@ class AnalysisRun(Base, TimestampMixin):
 
     __tablename__ = "analysis_runs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     trigger: Mapped[str] = mapped_column(String(32), nullable=False)  # cron/manual/api
     bar_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     timeframe: Mapped[str] = mapped_column(String(8), nullable=False, default="4h")
@@ -161,9 +167,9 @@ class Signal(Base, TimestampMixin):
 
     __tablename__ = "signals"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     run_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("analysis_runs.id", ondelete="SET NULL")
+        PK, ForeignKey("analysis_runs.id", ondelete="SET NULL")
     )
 
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -233,12 +239,12 @@ class Order(Base, TimestampMixin):
 
     __tablename__ = "orders"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     signal_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("signals.id", ondelete="SET NULL")
+        PK, ForeignKey("signals.id", ondelete="SET NULL")
     )
     position_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("positions.id", ondelete="SET NULL")
+        PK, ForeignKey("positions.id", ondelete="SET NULL")
     )
 
     client_order_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -288,9 +294,9 @@ class Position(Base, TimestampMixin):
 
     __tablename__ = "positions"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     signal_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("signals.id", ondelete="SET NULL"), unique=True
+        PK, ForeignKey("signals.id", ondelete="SET NULL"), unique=True
     )
 
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -346,7 +352,7 @@ class AccountSnapshot(Base):
 
     __tablename__ = "account_snapshots"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
@@ -370,7 +376,7 @@ class CircuitBreakerState(Base, TimestampMixin):
 
     __tablename__ = "circuit_breaker_state"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(PK, primary_key=True, autoincrement=True)
     reason: Mapped[str] = mapped_column(String(64), nullable=False)
     detail: Mapped[str | None] = mapped_column(Text)
     tripped_at: Mapped[datetime] = mapped_column(

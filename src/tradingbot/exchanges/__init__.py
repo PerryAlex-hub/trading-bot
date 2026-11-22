@@ -11,7 +11,25 @@ On a 4h timeframe the price difference between venues is noise, but a signal is
 validated against the WEEX mark price before it is ever acted on.
 """
 
+from .base import (
+    CredentialsNotVerified,
+    ExecutionVenue,
+    MarketDataSource,
+    VenueError,
+    VenuePosition,
+)
 from .binance import BinanceHistory
 from .weex import WeexClient, WeexEndpointError
+from .weex_private import WeexTradingClient
 
-__all__ = ["WeexClient", "WeexEndpointError", "BinanceHistory"]
+__all__ = [
+    "BinanceHistory",
+    "CredentialsNotVerified",
+    "ExecutionVenue",
+    "MarketDataSource",
+    "VenueError",
+    "VenuePosition",
+    "WeexClient",
+    "WeexEndpointError",
+    "WeexTradingClient",
+]
