@@ -644,20 +644,32 @@ class PositionRepo:
         return position
 
     def closed_since(self, since: datetime) -> list[Position]:
+        # `id` breaks ties on closed_at: see recent_closed() for why that
+        # matters.
         return list(
             self.session.execute(
                 select(Position)
                 .where(Position.is_open.is_(False), Position.closed_at >= since)
-                .order_by(Position.closed_at)
+                .order_by(Position.closed_at, Position.id)
             ).scalars()
         )
 
     def recent_closed(self, limit: int = 50) -> list[Position]:
+        """Closed positions, newest first.
+
+        The `id` tiebreaker is load-bearing, not tidiness. Several positions
+        can close in the same microsecond - the monitor's reconcile loop does
+        exactly that when it discovers two stops filled while the bot was
+        asleep. Ordering on `closed_at` alone leaves their relative order
+        arbitrary, and `consecutive_losses()` stops counting at the first win,
+        so an arbitrary tie order produces a wrong streak and therefore a
+        wrong circuit-breaker decision.
+        """
         return list(
             self.session.execute(
                 select(Position)
                 .where(Position.is_open.is_(False))
-                .order_by(Position.closed_at.desc())
+                .order_by(Position.closed_at.desc(), Position.id.desc())
                 .limit(limit)
             ).scalars()
         )

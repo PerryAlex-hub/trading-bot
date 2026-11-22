@@ -283,6 +283,28 @@ class TestPositionRepo:
             repo.close(position, exit_price=exit_price, reason="x")
         assert repo.consecutive_losses() == 2
 
+    def test_streak_is_deterministic_when_positions_close_together(self, session) -> None:
+        """REGRESSION: several positions can close in the same microsecond.
+
+        The monitor's reconcile loop does exactly that when it finds two stops
+        filled while the bot was asleep. Ordering on closed_at alone left their
+        order arbitrary, and consecutive_losses() stops at the first win - so
+        the streak, and the circuit-breaker decision built on it, was
+        non-deterministic.
+        """
+        repo = PositionRepo(session)
+        for exit_price in (Decimal("90"), Decimal("120"), Decimal("90"), Decimal("90")):
+            position = repo.create(
+                symbol="BTCUSDT", side=Side.LONG, quantity=Decimal("1"),
+                entry_price=Decimal("100"), stop_price=Decimal("90"),
+                target_price=Decimal("120"), leverage=Decimal("1"),
+                signal_id=None, is_paper=True,
+            )
+            repo.close(position, exit_price=exit_price, reason="x")
+
+        # Two losses after the win, regardless of timestamp collisions.
+        assert [repo.consecutive_losses() for _ in range(5)] == [2] * 5
+
     def test_a_live_position_without_a_stop_is_flagged(self, session) -> None:
         """The alarm condition of the whole design."""
         repo = PositionRepo(session)
