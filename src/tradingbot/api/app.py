@@ -479,6 +479,15 @@ def telegram_status() -> dict[str, Any]:
     return {
         "token_configured": settings.telegram_bot_token is not None,
         "secret_configured": settings.telegram_webhook_secret is not None,
+        # Whether strangers are answered. Reported explicitly because
+        # `authorised_chats` alone is misleading: it stays 1 in public mode,
+        # so the status looked identical whether the bot answered one person
+        # or everyone, and the setting lives on the deployed service rather
+        # than in the local .env where you set it.
+        "public_mode": settings.telegram_is_public,
+        "who_can_use_it": (
+            "anyone" if settings.telegram_is_public else "only the authorised chat(s)"
+        ),
         "authorised_chats": len(settings.allowed_chat_ids()),
         "webhook": (
             {
