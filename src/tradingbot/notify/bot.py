@@ -28,6 +28,7 @@ attacker the endpoint is real.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -41,6 +42,28 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org"
 MAX_MESSAGE_LENGTH = 4096
+
+# Per-chat command timestamps for the public-mode rate limiter. Process-local
+# and therefore lost on restart; see TelegramBot.rate_limit_exceeded for why
+# that trade-off is deliberate.
+_RATE_BUCKETS: dict[tuple[str, str], list[float]] = {}
+# Hard ceiling on tracked chats, so a flood of distinct ids cannot grow this
+# without bound in a long-lived process.
+_RATE_BUCKET_LIMIT = 2000
+
+
+def _prune_rate_buckets(now: float) -> None:
+    """Drop stale entries, and everything if the map has grown too large."""
+    if len(_RATE_BUCKETS) <= _RATE_BUCKET_LIMIT:
+        return
+    for key in [
+        key
+        for key, stamps in _RATE_BUCKETS.items()
+        if not stamps or now - stamps[-1] > 120.0
+    ]:
+        _RATE_BUCKETS.pop(key, None)
+    if len(_RATE_BUCKETS) > _RATE_BUCKET_LIMIT:
+        _RATE_BUCKETS.clear()
 
 HELP_TEXT = """*trading-bot*
 
@@ -57,7 +80,8 @@ sent here. These commands are for looking at what it has been doing.
 */runs* - recent scheduled runs, to check the scheduler is firing
 */help* - this message
 
-This bot has no exchange credentials and cannot place orders.
+This bot has no exchange credentials and cannot place orders. Signals are
+analysis, not advice, and are not a recommendation to trade.
 """
 
 
@@ -148,7 +172,62 @@ class TelegramBot:
         return hmac.compare_digest(header_value, expected)
 
     def is_authorised(self, chat_id: str) -> bool:
+        """Whether this chat may issue commands.
+
+        In public mode everyone may, which is what removes the friction of
+        collecting chat ids. The webhook secret is still required, because it
+        authenticates Telegram rather than the user - without it anyone could
+        POST forged updates directly to the endpoint and impersonate any chat.
+        """
+        if self.settings.telegram_is_public:
+            return True
         return chat_id in self.allowed
+
+    def rate_limit_exceeded(self, chat_id: str, command: str) -> str | None:
+        """Throttle one chat. Returns a message to send back, or None.
+
+        Only enforced in public mode: a private bot throttling its single
+        owner would be pure annoyance. `/analyse` gets a tighter budget than
+        the read-only commands because it loads several hundred candles across
+        four timeframes and recomputes the whole indicator stack, so an
+        unthrottled loop would hold Neon's compute awake continuously and
+        exhaust the free 100 CU-hour month - which suspends the project, not
+        just the request.
+
+        The counters live in memory, so they reset when the service restarts
+        or spins down. That is a real weakness, but it costs nothing and
+        removes the cheap abuse case; a persistent limiter would mean a
+        database write per command, which is the very thing being conserved.
+        """
+        if not self.settings.telegram_is_public:
+            return None
+
+        expensive = command in ("analyse", "analyze")
+        limit = (
+            self.settings.telegram_analyse_limit_per_minute
+            if expensive
+            else self.settings.telegram_rate_limit_per_minute
+        )
+        bucket = "analyse" if expensive else "general"
+        now = time.monotonic()
+        key = (chat_id, bucket)
+
+        hits = [stamp for stamp in _RATE_BUCKETS.get(key, ()) if now - stamp < 60.0]
+        if len(hits) >= limit:
+            wait = int(60.0 - (now - hits[0])) + 1
+            _RATE_BUCKETS[key] = hits
+            return (
+                f"Rate limit reached ({limit}/min for "
+                f"{'/analyse' if expensive else 'commands'}). "
+                f"Try again in {wait}s.\n\n"
+                "_This bot runs on a free tier; the limit protects its monthly "
+                "compute budget._"
+            )
+
+        hits.append(now)
+        _RATE_BUCKETS[key] = hits
+        _prune_rate_buckets(now)
+        return None
 
     # -- dispatch ----------------------------------------------------------
 
@@ -161,6 +240,11 @@ class TelegramBot:
         if not self.is_authorised(command.chat_id):
             log.warning("Rejected a command from unauthorised chat %s", command.chat_id)
             return None
+
+        throttled = self.rate_limit_exceeded(command.chat_id, command.name)
+        if throttled is not None:
+            log.info("Rate-limited /%s from chat %s", command.name, command.chat_id)
+            return throttled
 
         handlers = {
             "start": self._help,
@@ -611,6 +695,92 @@ def webhook_info(settings: Settings) -> dict[str, Any] | None:
         return response.json().get("result") if response.status_code == 200 else None
     except httpx.HTTPError:
         return None
+
+
+def discover_chat_ids(settings: Settings) -> tuple[list[dict[str, Any]], str]:
+    """Find which chats have messaged the bot.
+
+    Saves reading `getUpdates` JSON by hand, which is the fiddliest step of
+    setting a Telegram bot up and the easiest one to get wrong.
+
+    Returns `(chats, note)`. `getUpdates` is mutually exclusive with a
+    registered webhook - Telegram answers 409 - so the note explains that case
+    rather than leaving a bare failure, since during setup the webhook usually
+    is not registered yet and after setup it always is.
+    """
+    if settings.telegram_bot_token is None:
+        return [], "TELEGRAM_BOT_TOKEN is not set"
+
+    token = settings.telegram_bot_token.get_secret_value()
+    try:
+        response = httpx.get(f"{API_BASE}/bot{token}/getUpdates", timeout=20.0)
+    except httpx.HTTPError as exc:
+        return [], f"could not reach Telegram: {exc}"
+
+    if response.status_code == 404:
+        return [], "Telegram rejected the token (404). Check it was copied in full."
+    if response.status_code == 409:
+        return [], (
+            "a webhook is already registered, so getUpdates is unavailable "
+            "(Telegram allows one or the other). This is expected after "
+            "`telegram-setup`; the bot is already working."
+        )
+    if response.status_code != 200:
+        return [], f"Telegram returned {response.status_code}: {response.text[:200]}"
+
+    payload = response.json()
+    if not payload.get("ok"):
+        return [], f"Telegram refused: {payload}"
+
+    seen: dict[str, dict[str, Any]] = {}
+    for item in payload.get("result", []):
+        message = (
+            item.get("message")
+            or item.get("edited_message")
+            or item.get("channel_post")
+            or {}
+        )
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
+            continue
+        seen[str(chat_id)] = {
+            "chat_id": str(chat_id),
+            "type": chat.get("type"),
+            "name": (
+                chat.get("username")
+                or " ".join(
+                    part
+                    for part in (chat.get("first_name"), chat.get("last_name"))
+                    if part
+                )
+                or chat.get("title")
+                or "?"
+            ),
+            "last_text": str(message.get("text") or "")[:40],
+        }
+
+    if not seen:
+        return [], (
+            "the token works, but nobody has messaged the bot yet. Open it in "
+            "Telegram, send /start, then run this again."
+        )
+    return list(seen.values()), ""
+
+
+def bot_identity(settings: Settings) -> dict[str, Any] | None:
+    """Confirm the token is valid and return the bot's own username."""
+    if settings.telegram_bot_token is None:
+        return None
+    token = settings.telegram_bot_token.get_secret_value()
+    try:
+        response = httpx.get(f"{API_BASE}/bot{token}/getMe", timeout=20.0)
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200:
+        return None
+    payload = response.json()
+    return payload.get("result") if payload.get("ok") else None
 
 
 def set_command_menu(settings: Settings) -> bool:

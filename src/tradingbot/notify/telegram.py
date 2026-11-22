@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 import httpx
 
@@ -196,17 +196,43 @@ class TelegramNotifier:
 
 
 def _fmt(value: Decimal | float | None) -> str:
-    """Format a price without scientific notation or trailing zeros.
+    """Format a number for a human reading a phone notification.
 
-    The universe spans BTC at five figures and satellite tokens at four
-    decimals, and `str(Decimal)` will happily produce `1E-7`, which is
-    unreadable in a trading alert.
+    Two problems to solve at once. `str(Decimal)` produces `1E-7`, which is
+    unreadable; and the computed values carry full Decimal precision, so a real
+    signal rendered as `60949.98127637765741` with a size of
+    `0.000176171075538736`. Both are technically correct and neither can be
+    read at a glance, which for an alert you act on is a defect.
+
+    Precision scales with magnitude rather than being fixed, because the
+    universe spans BTC at five figures and tokens at eight decimal places. No
+    rounding is applied to the stored values - only to this display - since the
+    exact numbers belong in the journal.
     """
     if value is None:
         return "n/a"
+
     decimal_value = Decimal(str(value))
-    text = format(decimal_value.normalize(), "f")
-    return text
+    if decimal_value == 0:
+        return "0"
+
+    magnitude = abs(decimal_value)
+    if magnitude >= 1000:
+        quantum = Decimal("0.01")
+    elif magnitude >= 1:
+        quantum = Decimal("0.0001")
+    elif magnitude >= Decimal("0.01"):
+        quantum = Decimal("0.000001")
+    else:
+        # Sub-cent prices and tiny quantities: keep four significant figures
+        # so a satellite token at 0.00004212 stays distinguishable.
+        exponent = magnitude.adjusted()  # power of ten of the leading digit
+        quantum = Decimal(1).scaleb(exponent - 3)
+
+    rounded = decimal_value.quantize(quantum, rounding=ROUND_HALF_UP)
+    # normalize() strips trailing zeros but can re-introduce exponent form on
+    # integers (1E+2), so reformat with "f" afterwards.
+    return format(rounded.normalize(), "f")
 
 
 def _pct(value: Decimal, reference: Decimal) -> str:

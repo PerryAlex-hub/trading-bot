@@ -9,6 +9,7 @@ dies on deploy" class of bug.
 from __future__ import annotations
 
 import datetime as dt
+import os
 from decimal import Decimal
 
 import numpy as np
@@ -19,6 +20,33 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tradingbot.db.schema import Base
 from tradingbot.models import Candle, ContractSpec
+
+
+@pytest.fixture(autouse=True)
+def isolate_settings_from_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop the suite reading the developer's real .env file.
+
+    Without this, `Settings()` in a test picks up whatever happens to be
+    configured on the machine, so tests pass or fail depending on local
+    credentials. That has already bitten this project twice: a bot test
+    asserted a handler fails (true only while DATABASE_URL was unset) and an
+    authorisation test asserted no chat ids exist (true only until a real
+    TELEGRAM_CHAT_ID was added).
+
+    Also clears the lru_cache on get_settings, so a cached instance built
+    before isolation cannot leak into a test.
+    """
+    from tradingbot import settings as settings_module
+
+    monkeypatch.setitem(settings_module.Settings.model_config, "env_file", None)
+    for name in list(os.environ):
+        if name.startswith(
+            ("TELEGRAM_", "DATABASE_", "WEEX_", "BINANCE_", "ANTHROPIC_", "TRADING_")
+        ):
+            monkeypatch.delenv(name, raising=False)
+    settings_module.get_settings.cache_clear()
+    yield
+    settings_module.get_settings.cache_clear()
 
 
 @pytest.fixture

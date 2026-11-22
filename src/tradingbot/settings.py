@@ -93,6 +93,17 @@ class Settings(BaseSettings):
     # Chat ids allowed to issue commands. Defaults to telegram_chat_id alone.
     # Without this the bot would answer anyone who found it in search.
     telegram_allowed_chat_ids: str | None = None
+    # Let anyone who finds the bot use it. Removes the friction of collecting
+    # chat ids, at the cost of making the journal readable by strangers. The
+    # bot cannot trade, so the real exposure is privacy plus free-tier compute:
+    # `/analyse` is expensive, hence the rate limit that public mode enables.
+    telegram_public: bool = False
+    # Commands per chat per minute. Applies in public mode, where an
+    # unthrottled `/analyse` loop would wake Neon continuously and burn the
+    # 100 CU-hour monthly allowance, suspending the project for the rest of
+    # the month.
+    telegram_rate_limit_per_minute: int = 12
+    telegram_analyse_limit_per_minute: int = 4
 
     # -- reasoning layer --------------------------------------------------
     anthropic_api_key: SecretStr | None = None
@@ -175,6 +186,18 @@ class Settings(BaseSettings):
                 if part.strip()
             )
         return frozenset({self.telegram_chat_id}) if self.telegram_chat_id else frozenset()
+
+    @property
+    def telegram_is_public(self) -> bool:
+        """Whether the bot answers anyone.
+
+        Requires the webhook secret regardless. That secret authenticates
+        *Telegram itself*, not the user: without it anyone could POST forged
+        updates straight to the endpoint, bypassing Telegram and impersonating
+        any chat id. Public access and an unauthenticated endpoint are
+        different things, and only the first one was asked for.
+        """
+        return self.telegram_public and self.telegram_webhook_secret is not None
 
     def resolved_config_dir(self) -> Path:
         if self.config_dir is not None:

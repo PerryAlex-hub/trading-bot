@@ -119,6 +119,100 @@ class TestChatAuthorisation:
         assert bot.handle(update("/status")) is None
 
 
+class TestPublicMode:
+    """Public access removes the chat-id friction but not the webhook secret."""
+
+    def _public(self, **overrides):
+        base = {
+            "telegram_chat_id": "12345",
+            "telegram_bot_token": "token",
+            "telegram_webhook_secret": "s3cret",
+            "telegram_public": True,
+        }
+        base.update(overrides)
+        return Settings(**base)
+
+    def test_a_stranger_is_answered_in_public_mode(self) -> None:
+        bot = TelegramBot(self._public())
+        assert bot.is_authorised("99999")
+        assert bot.handle(update("/help", chat_id="99999")) is not None
+
+    def test_public_mode_still_requires_the_webhook_secret(self) -> None:
+        """The secret authenticates Telegram, not the user.
+
+        Without it anyone could POST forged updates straight to the endpoint
+        and impersonate any chat id, which is a different thing from letting
+        strangers use the bot.
+        """
+        bot = TelegramBot(self._public(telegram_webhook_secret=None))
+        assert not bot.settings.telegram_is_public
+        assert not bot.is_authorised("99999")
+
+    def test_private_mode_is_unchanged(self) -> None:
+        bot = TelegramBot(self._public(telegram_public=False))
+        assert bot.is_authorised("12345")
+        assert not bot.is_authorised("99999")
+
+
+class TestRateLimit:
+    """Public mode must not let a stranger exhaust the free compute budget."""
+
+    def _public(self, **overrides):
+        base = {
+            "telegram_chat_id": "12345",
+            "telegram_bot_token": "token",
+            "telegram_webhook_secret": "s3cret",
+            "telegram_public": True,
+        }
+        base.update(overrides)
+        return Settings(**base)
+
+    def setup_method(self) -> None:
+        from tradingbot.notify.bot import _RATE_BUCKETS
+
+        _RATE_BUCKETS.clear()
+
+    def test_general_commands_are_capped(self) -> None:
+        bot = TelegramBot(self._public(telegram_rate_limit_per_minute=3))
+        for _ in range(3):
+            assert bot.rate_limit_exceeded("777", "status") is None
+        message = bot.rate_limit_exceeded("777", "status")
+        assert message is not None and "Rate limit" in message
+
+    def test_analyse_has_its_own_tighter_budget(self) -> None:
+        """It reloads hundreds of candles and recomputes everything."""
+        bot = TelegramBot(
+            self._public(
+                telegram_rate_limit_per_minute=50,
+                telegram_analyse_limit_per_minute=2,
+            )
+        )
+        assert bot.rate_limit_exceeded("777", "analyse") is None
+        assert bot.rate_limit_exceeded("777", "analyse") is None
+        assert bot.rate_limit_exceeded("777", "analyse") is not None
+        # The cheap commands are unaffected by the analyse budget.
+        assert bot.rate_limit_exceeded("777", "status") is None
+
+    def test_chats_are_limited_independently(self) -> None:
+        bot = TelegramBot(self._public(telegram_rate_limit_per_minute=1))
+        assert bot.rate_limit_exceeded("aaa", "status") is None
+        assert bot.rate_limit_exceeded("aaa", "status") is not None
+        assert bot.rate_limit_exceeded("bbb", "status") is None
+
+    def test_a_private_bot_is_never_throttled(self) -> None:
+        """Throttling your own single owner would be pure annoyance."""
+        bot = TelegramBot(self._public(telegram_public=False))
+        for _ in range(100):
+            assert bot.rate_limit_exceeded("12345", "analyse") is None
+
+    def test_throttling_is_enforced_through_handle(self) -> None:
+        bot = TelegramBot(self._public(telegram_rate_limit_per_minute=2))
+        assert bot.handle(update("/help", chat_id="555")) is not None
+        assert bot.handle(update("/help", chat_id="555")) is not None
+        third = bot.handle(update("/help", chat_id="555"))
+        assert third is not None and "Rate limit" in third
+
+
 class TestDispatch:
     def test_help_is_returned_without_touching_the_database(self) -> None:
         reply = TelegramBot(configured()).handle(update("/help"))
@@ -165,6 +259,44 @@ class TestDispatch:
         reply = TelegramBot(configured()).handle(update("/help"))
         assert reply is not None
         assert "cannot place orders" in reply
+
+
+class TestSignalNumberFormatting:
+    """The alert formatter. A signal you cannot read at a glance is a defect."""
+
+    def test_full_precision_prices_are_trimmed(self) -> None:
+        """Observed on a real BTC signal: 60949.98127637765741."""
+        from tradingbot.notify.telegram import _fmt
+
+        assert _fmt("60949.98127637765741") == "60949.98"
+
+    def test_tiny_quantities_keep_significant_figures(self) -> None:
+        """Observed on a real BTC signal: 0.000176171075538736."""
+        from tradingbot.notify.telegram import _fmt
+
+        assert _fmt("0.000176171075538736") == "0.0001762"
+
+    def test_sub_cent_prices_stay_distinguishable(self) -> None:
+        from tradingbot.notify.telegram import _fmt
+
+        assert _fmt("0.00004212345") == "0.00004212"
+
+    def test_no_scientific_notation(self) -> None:
+        from tradingbot.notify.telegram import _fmt
+
+        for value in ("1E-7", "1E+5", "0.00000001"):
+            assert "E" not in _fmt(value)
+
+    def test_whole_numbers_lose_their_decimals(self) -> None:
+        from tradingbot.notify.telegram import _fmt
+
+        assert _fmt("92000.00") == "92000"
+
+    def test_zero_and_none(self) -> None:
+        from tradingbot.notify.telegram import _fmt
+
+        assert _fmt("0") == "0"
+        assert _fmt(None) == "n/a"
 
 
 class TestNumberFormatting:
