@@ -56,6 +56,11 @@ services:
       # Required, or the webhook rejects all traffic and the bot is read-only.
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
-      # Your Render URL, e.g. https://tradingbot-api.onrender.com
+      # Optional here, and listed only for completeness. PUBLIC_BASE_URL is
+      # read by exactly one function, register_webhook(), which runs when you
+      # invoke `tradingbot telegram-setup` - and you run that from your own
+      # machine, not from this service. The running web service never reads it.
+      # Set it in your local .env instead; the value is the URL Render shows at
+      # the top of this service's page.
       - key: PUBLIC_BASE_URL
         sync: false
