@@ -1,21 +1,22 @@
-"""Position monitoring and venue reconciliation.
+"""Paper position resolution and circuit breakers.
 
-Runs far more often than the analysis cycle and is deliberately cheap: it exits
-in seconds when nothing is open. That is what makes a frequent schedule
-affordable on GitHub Actions' 2,000 free private-repo minutes.
+This job answers the only question that matters about a signal bot: **were the
+signals right?** There is no venue to reconcile against, because the bot places
+no orders. Instead it walks the candles printed since each simulated entry and
+decides whether the stop or the target was reached.
 
-It exists because of one consequence of the free-tier design: **the bot is
-asleep between runs, so the database's idea of the world can be wrong.** A stop
-can trigger at 03:00 and the bot will not know until it next wakes. Three
-things follow:
+Cheap by design: it exits in seconds when nothing is open, which is what makes
+a frequent schedule affordable inside GitHub Actions' free minutes.
 
-1. **Reconcile before anything else.** The venue is the source of truth. If the
-   database says a position is open and WEEX says it is not, the stop filled,
-   and the position must be closed in the journal with the correct exit.
-2. **An open position without a resting stop is an incident.** Nothing is
-   watching it. The monitor flattens it rather than hoping the next run is soon.
-3. **Circuit breakers trip here.** Losses are discovered at reconciliation, not
-   at execution, so the breaker check belongs on this path.
+Two honesty rules, both enforced in `execution/tracker.py`:
+
+* If one bar's range contains both the stop and the target, the **stop** is
+  assumed to have filled. OHLC cannot order two touches inside a bar, and
+  assuming the favourable one is how paper results stop predicting reality.
+* Round-trip taker fees are deducted, so a reported R-multiple is net.
+
+Circuit breakers trip here rather than at signal time, because that is when
+losses are discovered.
 """
 
 from __future__ import annotations
@@ -25,55 +26,64 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ..config import load_risk
+from ..config import load_risk, load_universe
 from ..db.engine import dispose_engine, session_scope, wait_for_database
 from ..db.repo import (
     AccountRepo,
+    CandleRepo,
     CircuitBreakerRepo,
-    OrderRepo,
     PositionRepo,
 )
-from ..models import OrderStatus
 from ..notify.telegram import TelegramNotifier
 from ..risk.gate import check_circuit_breakers_after_close
-from ..settings import Settings, TradingMode, get_settings
+from ..settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
+
+# A position whose stop and target are both never touched would otherwise hold
+# one of the two portfolio slots risk.yaml allows, forever, blocking every
+# later signal on that symbol.
+DEFAULT_MAX_HOLD_HOURS = 24 * 14
+
+# Enough 4h bars to cover the maximum hold with room to spare.
+BARS_FOR_RESOLUTION = 200
 
 
 @dataclass
 class MonitorResult:
     open_positions: int = 0
-    closed: int = 0
-    unprotected_found: int = 0
-    unprotected_fixed: int = 0
-    orders_reconciled: int = 0
+    resolved: int = 0
+    expired: int = 0
+    ambiguous: int = 0
     breaker_tripped: str | None = None
+    resolutions: list[str] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
 
     @property
     def quiet(self) -> bool:
-        """Whether nothing happened. Lets the caller skip a notification."""
+        """Nothing happened, so the caller can skip notifying."""
         return (
-            self.closed == 0
-            and self.unprotected_found == 0
+            self.resolved == 0
+            and self.expired == 0
             and self.breaker_tripped is None
             and not self.alerts
         )
 
     def describe(self) -> str:
         return (
-            f"{self.open_positions} open, {self.closed} closed, "
-            f"{self.unprotected_found} unprotected, "
-            f"{self.orders_reconciled} orders reconciled"
+            f"{self.open_positions} open, {self.resolved} resolved, "
+            f"{self.expired} expired"
+            + (f", {self.ambiguous} same-bar" if self.ambiguous else "")
         )
 
 
 def run_monitor(
     *, settings: Settings | None = None, notify: bool = True
 ) -> MonitorResult:
-    """Reconcile against the venue and act on anything that needs attention."""
+    """Resolve open paper positions against recent candles."""
     settings = settings or get_settings()
+    risk_config = load_risk()
+    universe = load_universe()
     result = MonitorResult()
 
     wait_for_database()
@@ -81,206 +91,127 @@ def run_monitor(
         with session_scope() as session:
             open_positions = PositionRepo(session).open_positions()
             result.open_positions = len(open_positions)
-            pending = OrderRepo(session).open_orders()
 
-        # Fast exit. This is what keeps a frequent schedule inside the free
-        # Actions minute budget: with no positions the job costs seconds.
-        if not open_positions and not pending:
-            log.info("Nothing open; monitor exiting early")
+        # Fast exit keeps a frequent schedule inside the free minute budget.
+        if not open_positions:
+            log.info("No open positions; monitor exiting early")
             return result
 
         notifier = TelegramNotifier(
-            bot_token=settings.telegram_bot_token.get_secret_value()
-            if settings.telegram_bot_token
-            else None,
+            bot_token=(
+                settings.telegram_bot_token.get_secret_value()
+                if settings.telegram_bot_token
+                else None
+            ),
             chat_id=settings.telegram_chat_id,
         )
 
-        venue = _venue(settings)
-        if venue is None:
-            # Paper positions cannot be reconciled against a real venue, but
-            # the unprotected check still applies to live ones.
-            log.info("No live venue available; skipping venue reconciliation")
-        else:
-            _reconcile(venue, result, notifier if notify else None, settings)
-
-        _check_unprotected(result, notifier if notify else None, settings)
+        _resolve_positions(
+            result,
+            notifier if notify else None,
+            primary_timeframe=universe.primary_timeframe,
+            taker_fee_pct=risk_config.decimal(
+                "costs", "assumed_taker_fee_pct", default="0.06"
+            ),
+        )
         _maybe_trip_breaker(result, notifier if notify else None)
 
         if notify and notifier.enabled and not result.quiet:
             notifier.send(f"Monitor: {result.describe()}")
 
     finally:
+        # Let Neon's compute suspend promptly, which protects the free
+        # 100 CU-hour monthly budget.
         dispose_engine()
 
     log.info("Monitor complete: %s", result.describe())
     return result
 
 
-def _venue(settings: Settings):
-    """A verified live client, or None.
-
-    Returns None rather than a paper broker: reconciliation compares the
-    database against reality, and a paper broker is not reality.
-    """
-    if settings.trading_mode is not TradingMode.LIVE:
-        return None
-
-    from ..exchanges.weex_private import WeexTradingClient
-
-    client = WeexTradingClient(
-        api_key=_secret(settings.weex_api_key),
-        api_secret=_secret(settings.weex_api_secret),
-        api_passphrase=_secret(settings.weex_api_passphrase),
-    )
-    verified, detail = client.verify_credentials()
-    if not verified:
-        log.error("Cannot reconcile: WEEX credentials failed verification (%s)", detail)
-        return None
-    return client
-
-
-def _reconcile(venue, result: MonitorResult, notifier, settings: Settings) -> None:
-    """Make the database agree with the venue.
-
-    The venue wins every disagreement. The database is a record of what this
-    bot believes; WEEX is a record of what is true.
-    """
-    try:
-        venue_positions = {
-            position.symbol: position for position in venue.open_positions()
-        }
-    except Exception as exc:
-        log.error("Could not read positions from the venue: %s", exc)
-        result.alerts.append(f"venue position read failed: {exc}")
-        return
+def _resolve_positions(
+    result: MonitorResult,
+    notifier: TelegramNotifier | None,
+    *,
+    primary_timeframe: str,
+    taker_fee_pct: Decimal,
+) -> None:
+    """Check each open paper position against the bars since it opened."""
+    from ..execution.tracker import PaperTracker
 
     with session_scope() as session:
-        repo = PositionRepo(session)
-        for position in repo.open_positions():
-            if position.is_paper:
+        positions = PositionRepo(session)
+        candles = CandleRepo(session)
+        tracker = PaperTracker(session=session, taker_fee_pct=taker_fee_pct)
+
+        for position in positions.open_positions():
+            if not position.is_paper:
+                # Should not exist: nothing in this codebase can open a live
+                # position. Flag it rather than silently ignoring it.
+                result.alerts.append(
+                    f"{position.symbol}: a NON-PAPER position exists, which this "
+                    "bot cannot create. Investigate manually."
+                )
                 continue
 
-            live = venue_positions.get(position.symbol)
-            if live is not None:
-                # Still open. Flag a size mismatch, which usually means a
-                # partial fill or a manual intervention.
-                if abs(live.quantity - position.quantity) > position.quantity * Decimal("0.01"):
-                    message = (
-                        f"{position.symbol}: database says {position.quantity}, "
-                        f"venue says {live.quantity}"
-                    )
-                    log.warning("Position size mismatch: %s", message)
-                    result.alerts.append(message)
+            series = candles.latest(
+                position.symbol, primary_timeframe, limit=BARS_FOR_RESOLUTION
+            )
+            if not series:
+                log.warning(
+                    "No %s candles stored for %s; cannot resolve",
+                    primary_timeframe,
+                    position.symbol,
+                )
                 continue
 
-            # The venue has no such position: a protective order filled while
-            # the bot was asleep. This is the normal, expected case.
-            exit_price = _infer_exit_price(position)
-            repo.close(
-                position,
-                exit_price=exit_price,
-                reason="closed_at_venue",
-            )
-            result.closed += 1
-            log.info(
-                "Reconciled %s as closed at the venue: exit %s, R=%s",
-                position.symbol,
-                exit_price,
-                position.r_multiple,
-            )
+            resolution = tracker.resolve(position, series)
+            if resolution is None:
+                # Still running. Expire it if it has gone nowhere for too long.
+                resolution = tracker.expire_stale(
+                    position,
+                    max_age_hours=DEFAULT_MAX_HOLD_HOURS,
+                    last_price=series[-1].close,
+                )
+                if resolution is not None:
+                    result.expired += 1
+            else:
+                result.resolved += 1
+                if resolution.ambiguous:
+                    result.ambiguous += 1
+
+            if resolution is None:
+                continue
+
+            result.resolutions.append(resolution.describe())
+            log.info("Resolved %s", resolution.describe())
+
             if notifier is not None and notifier.enabled:
                 notifier.send(
                     notifier.position_closed_message(
                         symbol=position.symbol,
                         side=position.side,
-                        exit_price=exit_price,
+                        exit_price=resolution.exit_price,
                         pnl=position.realised_pnl,
                         pnl_pct=position.realised_pnl_pct,
                         r_multiple=position.r_multiple,
-                        reason="stop or target filled while the bot was asleep",
-                        is_paper=False,
+                        reason=(
+                            f"{resolution.reason} hit"
+                            + (
+                                " (stop and target in one bar: stop assumed)"
+                                if resolution.ambiguous
+                                else ""
+                            )
+                        ),
+                        is_paper=True,
                     )
                 )
 
-    # Settle any order rows left PENDING by a crashed run.
-    with session_scope() as session:
-        order_repo = OrderRepo(session)
-        for order in order_repo.open_orders():
-            if order.is_paper:
-                continue
-            if order.venue_order_id is None and order.status == OrderStatus.PENDING.value:
-                # Recorded but never confirmed. Mark it FAILED so it does not
-                # linger as "maybe live" forever; the position reconciliation
-                # above is what actually establishes the truth.
-                order.status = OrderStatus.FAILED.value
-                order.error = (
-                    "no venue order id; the submitting run did not complete. "
-                    "Resolved by reconciliation."
-                )
-                result.orders_reconciled += 1
-        session.flush()
 
-
-def _infer_exit_price(position) -> Decimal:
-    """Best available exit price for a position closed while the bot slept.
-
-    Assumes the stop filled, which is the conservative choice: it records the
-    loss rather than guessing at a profit. The venue's fill history would be
-    better, but its endpoint shape is unverified in this codebase, so this
-    errs toward understating results instead of flattering them.
-    """
-    if position.stop_price is not None:
-        return position.stop_price
-    return position.entry_price
-
-
-def _check_unprotected(result: MonitorResult, notifier, settings: Settings) -> None:
-    """Find live positions with no stop at the venue and flatten them.
-
-    The alarm condition of the whole design. On free infrastructure nothing is
-    watching between runs, so an unprotected position is uncapped risk.
-    """
-    with session_scope() as session:
-        exposed = PositionRepo(session).open_without_stop()
-        result.unprotected_found = len(exposed)
-
-        if not exposed:
-            return
-
-        for position in exposed:
-            message = (
-                f"{position.symbol} {position.side} {position.quantity} is OPEN "
-                f"with no stop order at the venue"
-            )
-            log.error(message)
-            result.alerts.append(message)
-
-            if settings.can_place_real_orders:
-                from ..execution.engine import ExecutionEngine
-
-                venue = _venue(settings)
-                if venue is None:
-                    continue
-                engine = ExecutionEngine(session=session, venue=venue)
-                report = engine.close_position(position, reason="unprotected")
-                if report.ok:
-                    result.unprotected_fixed += 1
-                    log.info("Flattened unprotected position %s", position.symbol)
-
-        if notifier is not None and notifier.enabled:
-            notifier.alert(
-                "UNPROTECTED POSITION(S)",
-                "\n".join(result.alerts[:5])
-                + f"\n\nFlattened: {result.unprotected_fixed}/{len(exposed)}",
-            )
-
-
-def _maybe_trip_breaker(result: MonitorResult, notifier) -> None:
+def _maybe_trip_breaker(result: MonitorResult, notifier: TelegramNotifier | None) -> None:
     """Trip a circuit breaker if the day's losses breached a limit.
 
-    Checked here rather than at execution because losses are *discovered* at
-    reconciliation: the stop filled hours ago while the bot was asleep.
+    Checked here because losses are discovered at resolution time, not when the
+    signal was produced.
     """
     risk_config = load_risk()
     with session_scope() as session:
@@ -318,43 +249,46 @@ def _maybe_trip_breaker(result: MonitorResult, notifier) -> None:
         if notifier is not None and notifier.enabled:
             notifier.alert(
                 "CIRCUIT BREAKER TRIPPED",
-                f"{detail}\n\nNo new positions for {hours:.0f}h.",
+                f"{detail}\n\nNo new signals will be approved for {hours:.0f}h.",
             )
 
 
 def snapshot_account(*, settings: Settings | None = None) -> Decimal | None:
-    """Record current equity.
+    """Record simulated equity.
 
-    The daily-loss breaker is defined against the day's opening equity, so a
-    snapshot has to exist before the first trade of the day or the breaker has
-    no baseline to measure against.
+    The daily-loss breaker measures against the day's opening equity, so a
+    snapshot must exist before the first resolution of the day or the breaker
+    has no baseline. Equity is derived from the assumed starting balance plus
+    realised paper P&L; there is no account to query.
     """
     settings = settings or get_settings()
     risk_config = load_risk()
 
     wait_for_database()
-    equity: Decimal | None = None
-    is_paper = settings.trading_mode is not TradingMode.LIVE
-
-    if not is_paper:
-        venue = _venue(settings)
-        if venue is not None:
-            try:
-                equity = venue.account_equity()
-            except Exception as exc:
-                log.warning("Could not read account equity: %s", exc)
-
     with session_scope() as session:
-        if equity is None:
-            latest = AccountRepo(session).latest()
-            equity = latest.equity if latest else risk_config.assumed_equity
-        open_count = len(PositionRepo(session).open_positions())
-        AccountRepo(session).snapshot(
-            equity=equity, open_positions=open_count, is_paper=is_paper
+        positions = PositionRepo(session)
+        account = AccountRepo(session)
+
+        latest = account.latest()
+        baseline = latest.equity if latest is not None else risk_config.assumed_equity
+
+        # Only P&L realised since the last snapshot, so equity is not
+        # double-counted every time this runs.
+        since = (
+            latest.at
+            if latest is not None
+            else datetime.now(tz=UTC).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
         )
-    log.info("Recorded equity snapshot: %s USDT", equity)
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=UTC)
+        equity = baseline + positions.realised_pnl_since(since)
+
+        account.snapshot(
+            equity=equity,
+            open_positions=len(positions.open_positions()),
+            is_paper=True,
+        )
+    log.info("Recorded simulated equity snapshot: %s USDT", equity)
     return equity
-
-
-def _secret(value) -> str | None:
-    return value.get_secret_value() if value is not None else None

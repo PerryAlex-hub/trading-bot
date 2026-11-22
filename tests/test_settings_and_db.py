@@ -28,39 +28,67 @@ from tradingbot.settings import Settings, TradingMode
 from .conftest import make_candles
 
 
-class TestLiveTradingGate:
-    def test_live_mode_requires_the_second_switch(self) -> None:
-        with pytest.raises(ValueError, match="LIVE_TRADING_ENABLED"):
-            Settings(trading_mode=TradingMode.LIVE, live_trading_enabled=False)
+class TestNoLiveTrading:
+    """The guarantee is now structural rather than a gate.
 
-    def test_live_mode_requires_credentials(self) -> None:
-        with pytest.raises(ValueError, match="credentials are missing"):
-            Settings(trading_mode=TradingMode.LIVE, live_trading_enabled=True)
+    Previously two switches had to agree before real orders were possible.
+    Removing the capability entirely is a stronger property: there is no code
+    path to place an order, no credentials to hold, and therefore nothing for a
+    misconfiguration to arm.
+    """
 
-    def test_live_mode_with_both_switches_and_credentials_is_allowed(self) -> None:
-        settings = Settings(
-            trading_mode=TradingMode.LIVE,
-            live_trading_enabled=True,
-            weex_api_key="k",
-            weex_api_secret="s",
-            weex_api_passphrase="p",
+    def test_only_signal_only_and_paper_exist(self) -> None:
+        assert {mode.value for mode in TradingMode} == {"signal_only", "paper"}
+
+    def test_default_mode_is_signal_only(self) -> None:
+        assert Settings().trading_mode is TradingMode.SIGNAL_ONLY
+
+    def test_no_mode_can_place_real_orders(self) -> None:
+        for mode in TradingMode:
+            assert not Settings(trading_mode=mode).can_place_real_orders
+
+    def test_exchange_credentials_are_not_configurable(self) -> None:
+        """Nothing can supply a key, so nothing can authenticate."""
+        fields = set(Settings.model_fields)
+        assert "weex_api_key" not in fields
+        assert "weex_api_secret" not in fields
+        assert "weex_api_passphrase" not in fields
+        assert "live_trading_enabled" not in fields
+
+    def test_paper_mode_tracks_positions(self) -> None:
+        assert Settings(trading_mode=TradingMode.PAPER).tracks_paper_positions
+        assert not Settings(trading_mode=TradingMode.SIGNAL_ONLY).tracks_paper_positions
+
+
+class TestTelegramAuthorisation:
+    """Telegram is the user interface, so its access control is load-bearing."""
+
+    def test_the_delivery_chat_is_authorised_by_default(self) -> None:
+        assert Settings(telegram_chat_id="12345").allowed_chat_ids() == frozenset({"12345"})
+
+    def test_an_unconfigured_bot_authorises_nobody(self) -> None:
+        """Failing closed: an open bot would expose the journal to anyone."""
+        assert Settings().allowed_chat_ids() == frozenset()
+
+    def test_multiple_ids_can_be_listed(self) -> None:
+        settings = Settings(telegram_chat_id="1", telegram_allowed_chat_ids="1, 2 ,3")
+        assert settings.allowed_chat_ids() == frozenset({"1", "2", "3"})
+
+    def test_webhook_secret_is_required_to_accept_traffic(self) -> None:
+        from tradingbot.notify.bot import TelegramBot
+
+        bot = TelegramBot(Settings(telegram_chat_id="1"))
+        assert not bot.verify_secret("anything")
+        assert not bot.verify_secret(None)
+
+    def test_a_matching_secret_is_accepted(self) -> None:
+        from tradingbot.notify.bot import TelegramBot
+
+        bot = TelegramBot(
+            Settings(telegram_chat_id="1", telegram_webhook_secret="s3cret")
         )
-        assert settings.can_place_real_orders
-
-    def test_the_flag_alone_does_not_arm_anything(self) -> None:
-        """The dangerous near-miss: flag set, mode left at the default."""
-        settings = Settings(live_trading_enabled=True)
-        assert settings.trading_mode is TradingMode.SIGNAL_ONLY
-        assert not settings.can_place_real_orders
-
-    def test_paper_mode_never_places_real_orders(self) -> None:
-        settings = Settings(trading_mode=TradingMode.PAPER, live_trading_enabled=True)
-        assert not settings.can_place_real_orders
-
-    def test_default_is_signal_only(self) -> None:
-        settings = Settings()
-        assert settings.trading_mode is TradingMode.SIGNAL_ONLY
-        assert not settings.can_place_real_orders
+        assert bot.verify_secret("s3cret")
+        assert not bot.verify_secret("wrong")
 
 
 class TestDatabaseUrl:

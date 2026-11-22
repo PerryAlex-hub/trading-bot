@@ -1,5 +1,10 @@
 # The scheduler. This file IS the bot's cron.
 #
+# It is also the part of the deployment that must keep working no matter what:
+# the Render service can be suspended for exhausting its free hours and signals
+# will still arrive, because this workflow talks to Neon and Telegram directly
+# and does not depend on the API at all.
+#
 # Why GitHub Actions rather than a hosted worker: as of late 2026 there is no
 # free always-on worker anywhere. Fly removed the free allowance for new orgs
 # and Render's background workers are paid-only. But this bot does not need a
@@ -64,17 +69,13 @@ jobs:
       ENVIRONMENT: production
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       DATABASE_DIRECT_URL: ${{ secrets.DATABASE_DIRECT_URL }}
-      WEEX_API_KEY: ${{ secrets.WEEX_API_KEY }}
-      WEEX_API_SECRET: ${{ secrets.WEEX_API_SECRET }}
-      WEEX_API_PASSPHRASE: ${{ secrets.WEEX_API_PASSPHRASE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      # Two independent switches must agree before a real order can be placed,
-      # and both are repository VARIABLES rather than secrets so that what mode
-      # the bot is in is visible in the UI rather than hidden.
-      TRADING_MODE: ${{ vars.TRADING_MODE || 'signal_only' }}
-      LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED || 'false' }}
+      # signal_only or paper. There is no live mode: this project holds no
+      # exchange credentials and contains no code that could place an order.
+      # A repository VARIABLE rather than a secret, so the mode is visible.
+      TRADING_MODE: ${{ vars.TRADING_MODE || 'paper' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
       CONFIG_DIR: ${{ github.workspace }}/config
       CACHE_DIR: ${{ runner.temp }}/tradingbot-cache

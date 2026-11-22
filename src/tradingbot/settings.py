@@ -17,7 +17,7 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
@@ -30,16 +30,21 @@ class Environment(str, Enum):
 
 
 class TradingMode(str, Enum):
-    """What the bot is permitted to do with a signal it has approved.
+    """What the bot does with a signal it has approved.
 
-    SIGNAL_ONLY  - journal it and notify. No broker is touched at all.
-    PAPER        - journal it and simulate fills against the paper broker.
-    LIVE         - place real orders. Requires LIVE_TRADING_ENABLED as well.
+    SIGNAL_ONLY - journal it and send it to Telegram. Nothing is tracked.
+    PAPER       - also open a simulated position so the journal can measure
+                  whether the signals actually worked, in R.
+
+    There is deliberately no LIVE mode. This bot does not place orders, and
+    that is enforced by the absence of any code that could: there are no
+    exchange credentials in the settings and no authenticated endpoints in the
+    exchanges package. Removing the capability is a stronger guarantee than
+    gating it behind a flag.
     """
 
     SIGNAL_ONLY = "signal_only"
     PAPER = "paper"
-    LIVE = "live"
 
 
 class Settings(BaseSettings):
@@ -64,14 +69,19 @@ class Settings(BaseSettings):
     db_pool_size: int = 3
     db_max_overflow: int = 2
 
-    # -- venue credentials (execution only; market data is public) --------
-    weex_api_key: SecretStr | None = None
-    weex_api_secret: SecretStr | None = None
-    weex_api_passphrase: SecretStr | None = None
+    # No venue credentials. WEEX market data (quotes, funding, contract specs)
+    # is public, and nothing here places orders.
 
-    # -- delivery ---------------------------------------------------------
+    # -- Telegram: both the delivery channel AND the user interface --------
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
+    # Shared secret Telegram echoes back in X-Telegram-Bot-Api-Secret-Token.
+    # The webhook URL is effectively public, so this is what stops anyone who
+    # guesses it from injecting fake commands.
+    telegram_webhook_secret: SecretStr | None = None
+    # Chat ids allowed to issue commands. Defaults to telegram_chat_id alone.
+    # Without this the bot would answer anyone who found it in search.
+    telegram_allowed_chat_ids: str | None = None
 
     # -- reasoning layer --------------------------------------------------
     anthropic_api_key: SecretStr | None = None
@@ -83,8 +93,10 @@ class Settings(BaseSettings):
 
     # -- behaviour --------------------------------------------------------
     trading_mode: TradingMode = TradingMode.SIGNAL_ONLY
-    live_trading_enabled: bool = False
     log_level: str = "INFO"
+    # Public base URL of the deployed API, used to register the Telegram
+    # webhook. Telegram requires HTTPS and will not accept localhost.
+    public_base_url: str | None = None
 
     # Writable scratch space. On a read-only container filesystem this must
     # point somewhere real, hence /tmp rather than the project directory.
@@ -104,41 +116,21 @@ class Settings(BaseSettings):
     def _blank_to_none(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
 
-    @model_validator(mode="after")
-    def _guard_live_trading(self) -> Settings:
-        """Two independent switches must agree before real money is at risk.
-
-        `trading_mode=live` alone is not enough, and neither is the
-        `live_trading_enabled` flag. Requiring both means a single stray
-        environment variable in a deploy config cannot arm the bot.
-        """
-        if self.trading_mode is TradingMode.LIVE:
-            if not self.live_trading_enabled:
-                raise ValueError(
-                    "trading_mode=live requires LIVE_TRADING_ENABLED=true as well. "
-                    "Two switches must agree before real orders can be placed."
-                )
-            missing = [
-                name
-                for name, value in (
-                    ("WEEX_API_KEY", self.weex_api_key),
-                    ("WEEX_API_SECRET", self.weex_api_secret),
-                    ("WEEX_API_PASSPHRASE", self.weex_api_passphrase),
-                )
-                if value is None or not value.get_secret_value().strip()
-            ]
-            if missing:
-                raise ValueError(
-                    "trading_mode=live but these credentials are missing: "
-                    + ", ".join(missing)
-                )
-        return self
-
     # -- derived ----------------------------------------------------------
 
     @property
     def can_place_real_orders(self) -> bool:
-        return self.trading_mode is TradingMode.LIVE and self.live_trading_enabled
+        """Always False, and kept as an explicit, testable statement of fact.
+
+        Retained rather than deleted so that any caller still asking the
+        question gets a hard "no" instead of an AttributeError that someone
+        might "fix" by reintroducing the capability.
+        """
+        return False
+
+    @property
+    def tracks_paper_positions(self) -> bool:
+        return self.trading_mode is TradingMode.PAPER
 
     @property
     def is_production(self) -> bool:
@@ -157,6 +149,21 @@ class Settings(BaseSettings):
         if self.database_direct_url is not None:
             return self.database_direct_url.get_secret_value()
         return self.require_database_url().replace("-pooler", "")
+
+    def allowed_chat_ids(self) -> frozenset[str]:
+        """Chat ids permitted to command the bot.
+
+        Falls back to the delivery chat id so a single-user setup needs no
+        extra configuration. An empty set means the bot answers nobody, which
+        is the correct failure mode for an unconfigured deployment.
+        """
+        if self.telegram_allowed_chat_ids:
+            return frozenset(
+                part.strip()
+                for part in self.telegram_allowed_chat_ids.replace(";", ",").split(",")
+                if part.strip()
+            )
+        return frozenset({self.telegram_chat_id}) if self.telegram_chat_id else frozenset()
 
     def resolved_config_dir(self) -> Path:
         if self.config_dir is not None:

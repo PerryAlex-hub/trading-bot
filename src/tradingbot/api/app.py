@@ -1,21 +1,28 @@
-"""Read-mostly HTTP API, for the frontend and for health checks.
+"""HTTP service: the Telegram webhook, plus a read-only JSON API.
 
-Deployment shape this is built for: a Render free web service. Two consequences
-drive the design.
+Deployment shape: a Render free web service kept awake by an external pinger
+(cron-job.org hitting `/ping` every ~10 minutes). Three things follow.
 
-**It sleeps.** A free service spins down after 15 minutes idle and takes about
-a minute to wake. So the API is *not* on the critical path for trading: the
-scheduler runs the jobs, Telegram delivers the signals, and this service exists
-to read the journal. If it is asleep when nothing is looking at it, nothing is
-lost.
+**`/ping` must be as close to free as possible.** It touches no database and
+allocates almost nothing. This matters because Neon's free plan allows 100
+CU-hours per month, and a pinger that woke the database every 10 minutes would
+hold the compute on permanently and exhaust that budget. Keeping Render awake
+and keeping Neon asleep are both requirements, and they conflict unless the
+ping endpoint is deliberately inert.
 
-**It must not be the thing that trades.** Write endpoints are limited to
-operations a human explicitly triggers, and placing a new position is not among
-them. An HTTP endpoint that opens a trade is an HTTP endpoint that can be
-called twice.
+**The webhook is the user interface.** There is no frontend. `/telegram/webhook`
+receives commands and the bot replies in chat. The keep-alive is what makes
+those replies instant instead of waiting ~60s for a cold start.
 
-`/health` is deliberately cheap and does not touch the database, so an uptime
-pinger cannot burn the Neon compute budget by keeping the database awake.
+**Nothing here can trade.** The bot holds no exchange credentials and there is
+no execution code in the project, so this is a structural property rather than
+a configuration choice.
+
+Render's free allowance is 750 instance-hours per workspace per month and a
+31-day month is 744 hours, so an always-awake service consumes essentially all
+of it. If it runs out, every free web service in the workspace is suspended
+until the next month - but the GitHub Actions scheduler is independent, so
+signals keep arriving in Telegram and only these endpoints go dark.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -73,10 +80,9 @@ def _startup() -> None:
     configure_logging()
     settings = get_settings()
     log.info(
-        "API starting: env=%s mode=%s live_orders=%s",
+        "API starting: env=%s mode=%s (no execution capability)",
         settings.environment.value,
         settings.trading_mode.value,
-        settings.can_place_real_orders,
     )
 
 
@@ -98,8 +104,25 @@ def health() -> dict[str, Any]:
         "version": __version__,
         "environment": settings.environment.value,
         "trading_mode": settings.trading_mode.value,
-        "live_orders_enabled": settings.can_place_real_orders,
+        # Always false, and reported so a consumer never has to infer it.
+        "live_orders_enabled": False,
     }
+
+
+@app.get("/ping")
+def ping() -> dict[str, str]:
+    """Keep-alive target for an external pinger.
+
+    Deliberately the cheapest endpoint in the service: no database, no config
+    load, no settings read. Render free services spin down after 15 minutes
+    idle, so a ping every ~10 minutes holds it awake with margin for the
+    4-40 second jitter free cron services add.
+
+    Do NOT point a pinger at an endpoint that queries the database. Neon's free
+    compute suspends after 5 idle minutes, and waking it every 10 minutes
+    around the clock would burn the entire 100 CU-hour monthly allowance.
+    """
+    return {"status": "awake"}
 
 
 @app.get("/health/db")
@@ -248,7 +271,8 @@ def account(session: Session = Depends(get_session)) -> dict[str, Any]:
         "open_positions": len(positions.open_positions()),
         "consecutive_losses": positions.consecutive_losses(),
         "trading_mode": settings.trading_mode.value,
-        "live_orders_enabled": settings.can_place_real_orders,
+        # Always false, and reported so a consumer never has to infer it.
+        "live_orders_enabled": False,
         "circuit_breaker": (
             {
                 "reason": breaker.reason,
@@ -386,4 +410,84 @@ def stats(session: Session = Depends(get_session)) -> dict[str, Any]:
         "positions_closed": session.execute(
             select(func.count()).select_from(Position).where(Position.is_open.is_(False))
         ).scalar_one(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Telegram webhook: the user interface
+# ---------------------------------------------------------------------------
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    background: BackgroundTasks,
+    secret_token: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+) -> dict[str, bool]:
+    """Receive a Telegram update and answer it.
+
+    Returns 200 in every case, including rejection. Telegram retries on a
+    non-2xx response and will eventually disable a webhook that keeps failing,
+    so an error reply here would turn one bad update into an outage. A 200 on
+    rejection also avoids confirming to a prober that the endpoint is real.
+
+    The reply is sent in a background task so the handler returns immediately:
+    Telegram times out webhook deliveries, and an on-demand `/analyse` of a
+    symbol takes longer than that budget allows.
+    """
+    from ..notify.bot import TelegramBot
+
+    bot = TelegramBot(get_settings())
+
+    if not bot.verify_secret(secret_token):
+        log.warning("Rejected a webhook call with a bad or missing secret token")
+        return {"ok": True}
+
+    try:
+        update = await request.json()
+    except Exception:
+        log.warning("Webhook payload was not JSON")
+        return {"ok": True}
+
+    if not isinstance(update, dict):
+        return {"ok": True}
+
+    from ..notify.bot import BotCommand
+
+    command = BotCommand.parse(update)
+    if command is None or not bot.is_authorised(command.chat_id):
+        if command is not None:
+            log.warning("Unauthorised chat id %s", command.chat_id)
+        return {"ok": True}
+
+    def respond(chat_id: str, payload: dict) -> None:
+        reply = bot.handle(payload)
+        if reply:
+            bot.reply(chat_id, reply)
+
+    background.add_task(respond, command.chat_id, update)
+    return {"ok": True}
+
+
+@app.get("/telegram/status")
+def telegram_status() -> dict[str, Any]:
+    """Diagnose the webhook without exposing the token or the secret."""
+    from ..notify.bot import webhook_info
+
+    settings = get_settings()
+    info = webhook_info(settings)
+    return {
+        "token_configured": settings.telegram_bot_token is not None,
+        "secret_configured": settings.telegram_webhook_secret is not None,
+        "authorised_chats": len(settings.allowed_chat_ids()),
+        "webhook": (
+            {
+                "url_registered": bool(info.get("url")),
+                "pending_update_count": info.get("pending_update_count"),
+                "last_error_message": info.get("last_error_message"),
+                "last_error_date": info.get("last_error_date"),
+            }
+            if info
+            else None
+        ),
     }

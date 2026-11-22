@@ -25,7 +25,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .settings import TradingMode, configure_logging, get_settings
+from .settings import configure_logging, get_settings
 
 app = typer.Typer(
     add_completion=False,
@@ -114,7 +114,7 @@ def analyse(
     settings = get_settings()
     console.print(
         f"[bold]mode:[/bold] {settings.trading_mode.value} | "
-        f"live orders: {'YES' if settings.can_place_real_orders else 'no'}"
+        "orders: never (this project has no execution capability)"
     )
 
     if not skip_ingest:
@@ -162,42 +162,6 @@ def refresh_specs() -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.command("verify-credentials")
-def verify_credentials() -> None:
-    """Prove the WEEX signing scheme works. Required before live trading.
-
-    The authentication format in this codebase is inferred from the OKX/Bitget
-    convention, not confirmed against reachable documentation. This command
-    tries each variant against a read-only endpoint so a mismatch surfaces
-    harmlessly instead of on an order.
-    """
-    from .exchanges.weex_private import WeexTradingClient
-
-    settings = get_settings()
-    with WeexTradingClient(
-        api_key=_secret(settings.weex_api_key),
-        api_secret=_secret(settings.weex_api_secret),
-        api_passphrase=_secret(settings.weex_api_passphrase),
-    ) as client:
-        if not client.has_credentials:
-            console.print("[red]WEEX credentials are not set in the environment[/red]")
-            raise typer.Exit(code=1)
-
-        ok, detail = client.verify_credentials()
-        if ok:
-            console.print(f"[green]Credentials verified:[/green] {detail}")
-            equity = client.account_equity()
-            console.print(f"Account equity: {equity if equity is not None else 'unknown'}")
-        else:
-            console.print(f"[red]Verification failed[/red]\n{detail}")
-            console.print(
-                "\n[yellow]Live trading will refuse to place orders until this "
-                "passes.[/yellow] The signing scheme may differ from the assumed "
-                "one; the variants tried are in exchanges/weex_private.py."
-            )
-            raise typer.Exit(code=1)
-
-
 @app.command("clear-breaker")
 def clear_breaker() -> None:
     """Manually clear an active circuit breaker."""
@@ -217,39 +181,119 @@ def clear_breaker() -> None:
     console.print(f"[green]Cleared {count} breaker(s)[/green]")
 
 
-@app.command("close-position")
-def close_position(
+@app.command("close-paper")
+def close_paper(
     symbol: str = typer.Argument(..., help="e.g. BTCUSDT"),
     reason: str = typer.Option("manual", "--reason"),
 ) -> None:
-    """Close an open position at market."""
+    """Close a tracked paper position at the last stored price.
+
+    Bookkeeping only. No order is placed anywhere, because this project has no
+    execution capability.
+    """
     from .config import load_universe
     from .db.engine import session_scope
-    from .db.repo import PositionRepo
-    from .execution.engine import ExecutionEngine
-    from .jobs.analyze import _build_venue
+    from .db.repo import CandleRepo, PositionRepo
+    from .execution.tracker import PaperTracker
 
-    settings = get_settings()
     with session_scope() as session:
         position = PositionRepo(session).open_for_symbol(symbol.upper())
         if position is None:
-            console.print(f"[yellow]No open position in {symbol}[/yellow]")
+            console.print(f"[yellow]No open paper position in {symbol}[/yellow]")
             raise typer.Exit(code=1)
 
-        console.print(
-            f"{position.side} {position.quantity} {position.symbol} @ {position.entry_price}"
+        series = CandleRepo(session).latest(
+            position.symbol, load_universe().primary_timeframe, limit=1
         )
-        if not typer.confirm(f"Close it at market ({'LIVE' if not position.is_paper else 'paper'})?"):
+        if not series:
+            console.print("[red]No stored candles; cannot price the close[/red]")
+            raise typer.Exit(code=1)
+
+        last = series[-1].close
+        console.print(
+            f"{position.side} {position.quantity} {position.symbol} "
+            f"from {position.entry_price}, last price {last}"
+        )
+        if not typer.confirm("Close it in the journal?"):
             raise typer.Abort()
 
-        engine = ExecutionEngine(
-            session=session, venue=_build_venue(settings, load_universe())
+        resolution = PaperTracker(session=session).expire_stale(
+            position, max_age_hours=0, last_price=last
         )
-        report = engine.close_position(position, reason=reason)
 
-    console.print(
-        f"[{'green' if report.ok else 'red'}]{report.detail}[/]"
+    if resolution is None:
+        console.print("[red]Could not close the position[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]{resolution.describe()}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+
+@app.command("telegram-setup")
+def telegram_setup() -> None:
+    """Register the Telegram webhook and the command menu.
+
+    Run once after deploying the API, and again if PUBLIC_BASE_URL changes.
+    Telegram requires HTTPS, so this cannot target a local server.
+    """
+    from .notify.bot import register_webhook, set_command_menu, webhook_info
+
+    settings = get_settings()
+    ok, detail = register_webhook(settings)
+    if not ok:
+        console.print(f"[red]Webhook registration failed:[/red] {detail}")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]{detail}[/green]")
+    if set_command_menu(settings):
+        console.print("[green]Command menu registered[/green]")
+
+    info = webhook_info(settings)
+    if info:
+        console.print(f"  url           {info.get('url')}")
+        console.print(f"  pending       {info.get('pending_update_count')}")
+        if info.get("last_error_message"):
+            console.print(
+                f"  [yellow]last error  {info['last_error_message']}[/yellow]"
+            )
+    allowed = sorted(settings.allowed_chat_ids())
+    console.print()
+    if allowed:
+        console.print(f"Authorised chat ids: {allowed}")
+    else:
+        console.print(
+            "[red]No authorised chat ids.[/red] Set TELEGRAM_CHAT_ID, or the "
+            "bot will ignore every command it receives."
+        )
+
+
+@app.command("telegram-test")
+def telegram_test(
+    message: str = typer.Option("Test from trading-bot", "--message", "-m"),
+) -> None:
+    """Send a test message to confirm delivery works."""
+    from .notify.telegram import TelegramNotifier
+
+    settings = get_settings()
+    notifier = TelegramNotifier(
+        bot_token=(
+            settings.telegram_bot_token.get_secret_value()
+            if settings.telegram_bot_token
+            else None
+        ),
+        chat_id=settings.telegram_chat_id,
     )
+    if not notifier.enabled:
+        console.print("[red]Telegram is not configured[/red]")
+        raise typer.Exit(code=1)
+    if notifier.send(message):
+        console.print("[green]Sent[/green]")
+    else:
+        console.print("[red]Send failed; check the token and chat id[/red]")
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +311,7 @@ def status() -> None:
     console.print(
         f"[bold]environment[/bold] {settings.environment.value} | "
         f"[bold]mode[/bold] {settings.trading_mode.value} | "
-        f"[bold]live orders[/bold] {'YES' if settings.can_place_real_orders else 'no'}"
+        "[bold]orders[/bold] never"
     )
 
     with session_scope() as session:
@@ -403,7 +447,7 @@ def doctor() -> None:
     console.print("[bold]Configuration[/bold]")
     console.print(f"  environment      {settings.environment.value}")
     console.print(f"  trading mode     {settings.trading_mode.value}")
-    console.print(f"  live orders      {'YES' if settings.can_place_real_orders else 'no'}")
+    console.print("  orders           never (no execution code, no credentials)")
 
     # --- database ---------------------------------------------------------
     if settings.database_url is None:
@@ -474,27 +518,36 @@ def doctor() -> None:
     except Exception as exc:
         problems.append(f"config failed to load: {exc}")
 
-    # --- credentials ------------------------------------------------------
-    if settings.trading_mode is TradingMode.LIVE:
-        from .exchanges.weex_private import WeexTradingClient
-
-        with WeexTradingClient(
-            api_key=_secret(settings.weex_api_key),
-            api_secret=_secret(settings.weex_api_secret),
-            api_passphrase=_secret(settings.weex_api_passphrase),
-        ) as client:
-            ok, detail = client.verify_credentials()
-            if ok:
-                console.print(f"  WEEX auth        [green]verified[/green] ({detail})")
-            else:
-                problems.append(f"WEEX credentials failed verification: {detail}")
-    else:
-        console.print("  WEEX auth        not required in this mode")
-
+    # --- Telegram (the user interface, so this is load-bearing) ----------
     if settings.telegram_bot_token and settings.telegram_chat_id:
         console.print("  telegram         configured")
     else:
-        warnings.append("Telegram is not configured; signals will only be journaled")
+        problems.append(
+            "Telegram is not configured. It is the only delivery channel AND "
+            "the only user interface, so without it the bot runs silently."
+        )
+
+    if settings.telegram_bot_token is not None:
+        if settings.telegram_webhook_secret is None:
+            warnings.append(
+                "TELEGRAM_WEBHOOK_SECRET is not set, so the webhook rejects all "
+                "traffic and interactive commands will not work. Push signals "
+                "still work. Generate one with: python -c "
+                "\"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        if not settings.public_base_url:
+            warnings.append(
+                "PUBLIC_BASE_URL is not set, so `tradingbot telegram-setup` "
+                "cannot register the webhook."
+            )
+        if not settings.allowed_chat_ids():
+            warnings.append(
+                "No authorised chat ids, so the bot will ignore every command."
+            )
+        else:
+            console.print(
+                f"  bot commands     {len(settings.allowed_chat_ids())} authorised chat(s)"
+            )
 
     # --- verdict ----------------------------------------------------------
     console.print()
@@ -507,10 +560,6 @@ def doctor() -> None:
         console.print(f"\n[red]{len(problems)} problem(s) found[/red]")
         raise typer.Exit(code=1)
     console.print("\n[green]Deployment looks healthy[/green]")
-
-
-def _secret(value) -> str | None:
-    return value.get_secret_value() if value is not None else None
 
 
 if __name__ == "__main__":

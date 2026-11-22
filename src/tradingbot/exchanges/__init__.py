@@ -4,32 +4,27 @@ Two separate jobs, deliberately kept apart:
 
 * Binance public data -> deep, clean history for backtesting and feature
   computation. No account needed.
-* WEEX -> contract specifications, funding rates, live quotes and (later)
-  execution, because that is where the trades actually go.
+* WEEX public data -> contract specifications, funding rates and live quotes,
+  because that is the book a trade would actually be taken on and its spread is
+  what erodes the edge.
 
-On a 4h timeframe the price difference between venues is noise, but a signal is
-validated against the WEEX mark price before it is ever acted on.
+No authenticated endpoints and no credentials: the bot analyses and reports, it
+does not place orders. On a 4h timeframe the cross-venue price difference is
+noise, but a signal is still sanity-checked against the WEEX mark price so a
+stale or divergent setup is caught.
 """
 
-from .base import (
-    CredentialsNotVerified,
-    ExecutionVenue,
-    MarketDataSource,
-    VenueError,
-    VenuePosition,
-)
+from .base import MarketDataSource, VenueError
 from .binance import BinanceHistory
 from .weex import WeexClient, WeexEndpointError
-from .weex_private import WeexTradingClient
+from .weex_market import WeexMarketData, fetch_market_data
 
 __all__ = [
     "BinanceHistory",
-    "CredentialsNotVerified",
-    "ExecutionVenue",
     "MarketDataSource",
     "VenueError",
-    "VenuePosition",
     "WeexClient",
     "WeexEndpointError",
-    "WeexTradingClient",
+    "WeexMarketData",
+    "fetch_market_data",
 ]

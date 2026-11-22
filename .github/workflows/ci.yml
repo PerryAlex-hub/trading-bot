@@ -26,7 +26,6 @@ jobs:
       # database is a thing that will fail on deploy, and CI should catch that.
       ENVIRONMENT: ci
       TRADING_MODE: signal_only
-      LIVE_TRADING_ENABLED: "false"
       CONFIG_DIR: ${{ github.workspace }}/config
 
     steps:
@@ -50,17 +49,24 @@ jobs:
       - name: Test
         run: pytest -q --cov=tradingbot --cov-report=term-missing
 
-      # The live-trading gate is the one invariant worth asserting in CI
-      # itself: a refactor that lets trading_mode=live through without
-      # LIVE_TRADING_ENABLED would be catastrophic and silent.
-      - name: Assert the live-trading gate holds
+      # The strongest invariant this project has: there is no code path that
+      # could place an order. Asserted in CI so a future refactor that
+      # reintroduces an execution venue or exchange credentials fails loudly
+      # rather than passing unnoticed.
+      - name: Assert there is no execution capability
         run: |
           python - <<'PY'
+          import tradingbot.exchanges as exchanges
+          import tradingbot.execution as execution
           from tradingbot.settings import Settings, TradingMode
-          try:
-              Settings(trading_mode=TradingMode.LIVE, live_trading_enabled=False)
-          except Exception as exc:
-              print(f"OK: live mode refused without the second switch ({type(exc).__name__})")
-          else:
-              raise SystemExit("FAIL: live trading was accepted with only one switch set")
+
+          assert not hasattr(execution, "ExecutionEngine"), "an execution engine reappeared"
+          assert not hasattr(exchanges, "WeexTradingClient"), "an authenticated client reappeared"
+          assert {m.value for m in TradingMode} == {"signal_only", "paper"}, "a new trading mode appeared"
+          for mode in TradingMode:
+              assert not Settings(trading_mode=mode).can_place_real_orders
+          credentials = {"weex_api_key", "weex_api_secret", "weex_api_passphrase", "live_trading_enabled"}
+          leaked = credentials & set(Settings.model_fields)
+          assert not leaked, f"exchange credentials reappeared in settings: {leaked}"
+          print("OK: no execution capability, no exchange credentials")
           PY

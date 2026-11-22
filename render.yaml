@@ -11,6 +11,16 @@
 # only reads the journal, so it being asleep costs nothing but a slow first
 # page load.
 #
+# Kept awake by an external pinger (cron-job.org) hitting /ping every ~10
+# minutes. /ping touches no database, which matters: a pinger pointed at an
+# endpoint that queries Neon would hold its compute on permanently and exhaust
+# the free 100 CU-hour allowance.
+#
+# 750 instance-hours/month is per WORKSPACE and a 31-day month is 744 hours, so
+# an always-awake service uses essentially all of it. If it runs out, every free
+# web service here is suspended until next month - but the GitHub Actions
+# scheduler is independent, so signals keep arriving in Telegram.
+#
 # Deliberately NOT a background worker: those are paid-only on Render.
 
 services:
@@ -27,10 +37,10 @@ services:
         value: production
       # Read-only service. Hardcoded rather than inherited so no deploy
       # setting can ever arm the API to place orders.
+      # This service only reads the journal and serves the Telegram webhook.
+      # Paper positions are opened by the scheduler, not here.
       - key: TRADING_MODE
         value: signal_only
-      - key: LIVE_TRADING_ENABLED
-        value: "false"
       - key: CONFIG_DIR
         value: /app/config
       - key: LOG_LEVEL
@@ -38,4 +48,14 @@ services:
       # Set in the Render dashboard, not here: this file is committed.
       # Use the POOLED Neon string (the host containing '-pooler').
       - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      # Required, or the webhook rejects all traffic and the bot is read-only.
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      # Your Render URL, e.g. https://tradingbot-api.onrender.com
+      - key: PUBLIC_BASE_URL
         sync: false

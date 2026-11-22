@@ -42,8 +42,7 @@ from ..db.repo import (
     RunRepo,
     SignalRepo,
 )
-from ..execution.engine import ExecutionEngine
-from ..execution.paper import PaperBroker
+from ..execution.tracker import PaperTracker
 from ..models import Side, SignalStatus, Tier, Timeframe
 from ..notify.telegram import TelegramNotifier
 from ..risk.gate import PortfolioState, RiskGate
@@ -378,31 +377,37 @@ def _process(
         )
         signal_id = signal.id
 
-    executed = False
+    tracked = False
     detail = ""
 
-    # --- execution --------------------------------------------------------
-    if settings.trading_mode is not TradingMode.SIGNAL_ONLY and size is not None:
+    # --- paper tracking ---------------------------------------------------
+    # Not execution: nothing leaves this process and no venue is contacted. A
+    # simulated position is opened so the journal can later score this
+    # prediction in R, which is the only way to learn whether the analysis is
+    # worth anything.
+    if settings.tracks_paper_positions and size is not None:
         with session_scope() as session:
             stored_signal = SignalRepo(session).get(signal_id)
             if stored_signal is not None:
-                venue = _build_venue(settings, universe)
-                engine = ExecutionEngine(session=session, venue=venue, spec=spec)
-                report = engine.execute(
-                    signal=stored_signal, setup=setup, size=size, quote=quote
+                tracker = PaperTracker(
+                    session=session,
+                    taker_fee_pct=risk_config.decimal(
+                        "costs", "assumed_taker_fee_pct", default="0.06"
+                    ),
+                    satellite_symbols=satellite_symbols(universe),
                 )
-                executed = report.ok
-                detail = report.detail
-                if report.ok:
+                track = tracker.open(
+                    signal=stored_signal,
+                    setup=setup,
+                    size=size,
+                    quote=quote,
+                    spec=spec,
+                )
+                tracked = track.ok
+                detail = track.detail
+                if track.ok:
                     stored_signal.status = SignalStatus.EXECUTED.value
                     result.executed += 1
-                if report.needs_attention and notifier is not None:
-                    notifier.alert(
-                        "UNPROTECTED POSITION",
-                        f"{snapshot.symbol}: {report.detail}\n\n"
-                        "A position is open with no stop at the venue. "
-                        "Intervene manually.",
-                    )
 
     log.info(
         "%s APPROVED %s score=%+.3f%s",
@@ -422,8 +427,8 @@ def _process(
                 score=snapshot.score,
                 reasons=snapshot.confluence.top_reasons(),
                 warnings=decision.warnings,
-                is_paper=settings.trading_mode is not TradingMode.LIVE,
-                executed=executed,
+                is_paper=True,
+                executed=tracked,
             )
         )
         if sent:
@@ -458,67 +463,24 @@ def _portfolio_state(session, risk_config: RiskConfig) -> PortfolioState:
 
 
 def _market_data(symbol: str, settings: Settings):
-    """Fetch a live quote and funding rate from WEEX.
+    """Fetch a public quote and funding rate from WEEX.
 
-    Returns `(None, None)` on any failure. The risk gate decides what that
-    means: a veto in paper/live mode, tolerated in signal-only mode.
+    No credentials: these are public endpoints. Returns `(None, None)` on any
+    failure, and the risk gate decides what that means - a veto when a paper
+    position would be opened, tolerated in signal-only mode.
     """
-    from ..exchanges.weex_private import WeexTradingClient
+    from ..exchanges.weex_market import fetch_market_data
 
-    try:
-        with WeexTradingClient(
-            api_key=_secret(settings.weex_api_key),
-            api_secret=_secret(settings.weex_api_secret),
-            api_passphrase=_secret(settings.weex_api_passphrase),
-        ) as client:
-            return client.quote(symbol), client.funding(symbol)
-    except Exception as exc:
-        log.warning("Could not fetch WEEX market data for %s: %s", symbol, exc)
-        return None, None
+    return fetch_market_data(symbol)
 
 
-def _build_venue(settings: Settings, universe: Universe):
-    """Return the paper broker or the verified live client.
-
-    Live mode calls `verify_credentials()` first and falls back to paper if it
-    fails. The WEEX signing scheme in this codebase is inferred, so attempting
-    a real order against an unverified implementation is exactly the thing to
-    avoid.
-    """
-    satellites = frozenset(
+def satellite_symbols(universe: Universe) -> frozenset[str]:
+    """Symbols that get wider assumed slippage in paper fills."""
+    return frozenset(
         config.symbol
         for config in universe.symbols
         if config.tier in (Tier.SATELLITE, Tier.PAPER)
     )
-
-    if not settings.can_place_real_orders:
-        return PaperBroker(
-            equity=load_risk().assumed_equity, satellite_symbols=satellites
-        )
-
-    from ..exchanges.weex_private import WeexTradingClient
-
-    client = WeexTradingClient(
-        api_key=_secret(settings.weex_api_key),
-        api_secret=_secret(settings.weex_api_secret),
-        api_passphrase=_secret(settings.weex_api_passphrase),
-    )
-    verified, detail = client.verify_credentials()
-    if not verified:
-        log.error(
-            "WEEX credential verification FAILED (%s). Falling back to paper "
-            "execution rather than sending unverified live orders.",
-            detail,
-        )
-        return PaperBroker(
-            equity=load_risk().assumed_equity, satellite_symbols=satellites
-        )
-    log.info("WEEX credentials %s", detail)
-    return client
-
-
-def _secret(value) -> str | None:
-    return value.get_secret_value() if value is not None else None
 
 
 def _current_bar(timeframe: Timeframe) -> datetime:
