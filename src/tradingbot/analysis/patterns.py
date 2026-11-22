@@ -28,9 +28,10 @@ tracking the apex and reporting the break relative to it.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, Sequence
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -589,7 +590,8 @@ def detect_divergence(
         values = series.to_numpy(dtype=float)
         for swing_type in (SwingType.HIGH, SwingType.LOW):
             pivots = [swing for swing in swings if swing.type is swing_type][-3:]
-            for previous, current in zip(pivots, pivots[1:]):
+            # Pairwise walk; the slice is one shorter by design.
+            for previous, current in zip(pivots, pivots[1:]):  # noqa: B905
                 if current.index - previous.index > max_swing_gap:
                     continue
                 before, after = values[previous.index], values[current.index]

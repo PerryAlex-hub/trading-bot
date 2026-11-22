@@ -14,8 +14,9 @@ tolerance that is sensible for one is absurd for the other.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -279,6 +280,7 @@ def build_volume_profile(
         frame["low"].to_numpy(dtype=float),
         frame["high"].to_numpy(dtype=float),
         frame["volume"].to_numpy(dtype=float),
+        strict=True,  # same frame, so equal length is an invariant worth asserting
     ):
         if bar_high <= bar_low or bar_volume <= 0:
             continue

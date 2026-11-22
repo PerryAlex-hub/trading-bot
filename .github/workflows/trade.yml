@@ -1,0 +1,146 @@
+# The scheduler. This file IS the bot's cron.
+#
+# Why GitHub Actions rather than a hosted worker: as of late 2026 there is no
+# free always-on worker anywhere. Fly removed the free allowance for new orgs
+# and Render's background workers are paid-only. But this bot does not need a
+# daemon - its primary decision timeframe is 4h, so it needs six scheduled runs
+# a day, which is exactly what cron is for.
+#
+# MINUTE BUDGET. Read this before changing any schedule.
+#   * Public repo  -> unlimited Actions minutes. Nothing below matters.
+#   * Private repo -> 2,000 min/month, and GitHub's default spending limit of
+#     $0 makes that a HARD STOP, not an overage. Current cost:
+#         analyse  6 runs/day  x ~2 min = ~360 min/month
+#         monitor 24 runs/day  x ~0.4 min (exits early when flat) = ~290 min/month
+#         ------------------------------------------------------- ~650 min/month
+#     That leaves room for CI. A 15-minute analyse schedule would cost
+#     ~5,760 min/month and die around day 10 of every month.
+#
+# Schedules are intentionally offset a few minutes past the bar close: the
+# analysis uses the most recently CLOSED bar, and firing exactly on the
+# boundary risks racing the exchange's own candle finalisation.
+
+name: trade
+
+on:
+  schedule:
+    # Analysis, on 4h bar closes (00:00/04:00/08:00/12:00/16:00/20:00 UTC).
+    # GitHub can delay a scheduled run by 5-15 minutes under load; that is
+    # harmless here because the job derives its own bar time and refuses to
+    # re-analyse a bar it has already done.
+    - cron: "7 0,4,8,12,16,20 * * *"
+    # Position monitor, hourly. Cheap: exits in seconds when nothing is open.
+    - cron: "37 * * * *"
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Which job to run"
+        required: true
+        default: analyse
+        type: choice
+        options: [analyse, monitor, ingest, doctor, refresh-specs]
+      force:
+        description: "Re-analyse a bar that was already processed"
+        required: false
+        default: false
+        type: boolean
+
+# Never let two runs touch the database at once. A second analyse starting
+# while the first is mid-execution could double-submit; the client_order_id
+# guard would catch it, but not racing in the first place is better.
+concurrency:
+  group: trade-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      ENVIRONMENT: production
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DATABASE_DIRECT_URL: ${{ secrets.DATABASE_DIRECT_URL }}
+      WEEX_API_KEY: ${{ secrets.WEEX_API_KEY }}
+      WEEX_API_SECRET: ${{ secrets.WEEX_API_SECRET }}
+      WEEX_API_PASSPHRASE: ${{ secrets.WEEX_API_PASSPHRASE }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Two independent switches must agree before a real order can be placed,
+      # and both are repository VARIABLES rather than secrets so that what mode
+      # the bot is in is visible in the UI rather than hidden.
+      TRADING_MODE: ${{ vars.TRADING_MODE || 'signal_only' }}
+      LIVE_TRADING_ENABLED: ${{ vars.LIVE_TRADING_ENABLED || 'false' }}
+      LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
+      CONFIG_DIR: ${{ github.workspace }}/config
+      CACHE_DIR: ${{ runner.temp }}/tradingbot-cache
+      GIT_SHA: ${{ github.sha }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+
+      - name: Fail fast if the database is not configured
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. Add the POOLED Neon connection string (the host containing '-pooler')."
+            exit 1
+          fi
+
+      # Decide which job this invocation is. A scheduled run carries the cron
+      # expression that triggered it, which is how one workflow serves two
+      # different schedules.
+      - name: Select job
+        id: select
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "job=${{ inputs.job }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "37 * * * *" ]; then
+            echo "job=monitor" >> "$GITHUB_OUTPUT"
+          else
+            echo "job=analyse" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure schema exists
+        if: steps.select.outputs.job == 'analyse'
+        run: tradingbot init-db
+
+      - name: Run
+        run: |
+          case "${{ steps.select.outputs.job }}" in
+            analyse)
+              tradingbot analyse ${{ inputs.force == true && '--force' || '' }}
+              ;;
+            monitor)       tradingbot monitor ;;
+            ingest)        tradingbot ingest ;;
+            doctor)        tradingbot doctor ;;
+            refresh-specs) tradingbot refresh-specs ;;
+          esac
+
+      # A failed scheduled run is otherwise completely silent: nobody watches
+      # the Actions tab, and a bot that has quietly stopped analysing looks
+      # exactly like a market with no setups.
+      - name: Notify on failure
+        if: failure() && env.TELEGRAM_BOT_TOKEN != ''
+        run: |
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=BOT FAILURE: ${{ steps.select.outputs.job }} job failed. See GitHub Actions run ${{ github.run_id }}." \
+            > /dev/null || true

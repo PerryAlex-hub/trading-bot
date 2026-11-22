@@ -26,9 +26,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Sequence
 
 from ..analysis.regime import BetaEstimate, MarketRegime, effective_beta
 from ..config import RiskConfig
@@ -206,7 +205,7 @@ class RiskGate:
         vetoes: list[RiskVeto] = []
 
         if portfolio.halted_until is not None:
-            now = datetime.now(tz=timezone.utc)
+            now = datetime.now(tz=UTC)
             if portfolio.halted_until > now:
                 remaining = portfolio.halted_until - now
                 vetoes.append(

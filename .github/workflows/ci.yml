@@ -1,0 +1,66 @@
+# Tests and linting. Runs against in-memory SQLite, so CI needs no database
+# and no secrets - which is what keeps it inside the free minute budget and
+# means a fork can run it.
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # No DATABASE_URL on purpose: anything that silently requires a live
+      # database is a thing that will fail on deploy, and CI should catch that.
+      ENVIRONMENT: ci
+      TRADING_MODE: signal_only
+      LIVE_TRADING_ENABLED: "false"
+      CONFIG_DIR: ${{ github.workspace }}/config
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e . --no-deps
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Test
+        run: pytest -q --cov=tradingbot --cov-report=term-missing
+
+      # The live-trading gate is the one invariant worth asserting in CI
+      # itself: a refactor that lets trading_mode=live through without
+      # LIVE_TRADING_ENABLED would be catastrophic and silent.
+      - name: Assert the live-trading gate holds
+        run: |
+          python - <<'PY'
+          from tradingbot.settings import Settings, TradingMode
+          try:
+              Settings(trading_mode=TradingMode.LIVE, live_trading_enabled=False)
+          except Exception as exc:
+              print(f"OK: live mode refused without the second switch ({type(exc).__name__})")
+          else:
+              raise SystemExit("FAIL: live trading was accepted with only one switch set")
+          PY

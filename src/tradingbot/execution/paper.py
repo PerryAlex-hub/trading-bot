@@ -41,7 +41,7 @@ class PaperBroker:
     slippage_pct: Decimal = Decimal("0.02")
     satellite_slippage_pct: Decimal = Decimal("0.15")
     satellite_symbols: frozenset[str] = frozenset()
-    _positions: dict[str, "PaperPosition"] = field(default_factory=dict)
+    _positions: dict[str, PaperPosition] = field(default_factory=dict)
     _filled: dict[str, OrderResult] = field(default_factory=dict)
     _marks: dict[str, Decimal] = field(default_factory=dict)
 
@@ -169,7 +169,7 @@ class PaperBroker:
     def cancel_order(self, symbol: str, client_order_id: str) -> bool:
         return self._filled.pop(client_order_id, None) is not None
 
-    def open_positions(self) -> list["PaperPosition"]:
+    def open_positions(self) -> list[PaperPosition]:
         return list(self._positions.values())
 
     def account_equity(self) -> Decimal | None:

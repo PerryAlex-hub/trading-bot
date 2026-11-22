@@ -1,0 +1,517 @@
+"""Command-line interface.
+
+Every scheduled job is also a CLI command, deliberately. The GitHub Actions
+workflows invoke exactly these commands, so anything the scheduler does can be
+reproduced locally with the same entry point - no separate script that might
+drift from what production runs.
+
+    tradingbot init-db              create tables
+    tradingbot ingest               sync candles from Binance
+    tradingbot analyse              run one analysis cycle
+    tradingbot monitor              reconcile positions, check breakers
+    tradingbot verify-credentials   prove WEEX signing works (required for live)
+    tradingbot status               account, positions, recent signals
+    tradingbot journal              recent signals with their reasons
+    tradingbot doctor               check the deployment is wired up correctly
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .settings import TradingMode, configure_logging, get_settings
+
+app = typer.Typer(
+    add_completion=False,
+    help="Crypto signal-analysis bot: deterministic analysis, gated execution.",
+)
+console = Console()
+log = logging.getLogger(__name__)
+
+
+@app.callback()
+def main(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+    settings = get_settings()
+    if verbose:
+        object.__setattr__(settings, "log_level", "DEBUG")
+    configure_logging(settings)
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+
+@app.command("init-db")
+def init_db(
+    drop: bool = typer.Option(False, "--drop", help="DROP every table first"),
+) -> None:
+    """Create the schema.
+
+    Uses the direct (unpooled) Neon endpoint: PgBouncer in transaction mode
+    cannot reliably run DDL.
+    """
+    from .db.engine import get_migration_engine
+    from .db.schema import Base
+
+    engine = get_migration_engine()
+    if drop:
+        confirm = typer.confirm(
+            "This DROPS every table, including the signal journal. Continue?"
+        )
+        if not confirm:
+            raise typer.Abort()
+        Base.metadata.drop_all(engine)
+        console.print("[yellow]Dropped all tables[/yellow]")
+
+    Base.metadata.create_all(engine)
+    console.print(
+        f"[green]Schema ready[/green] ({len(Base.metadata.tables)} tables)"
+    )
+    for name in sorted(Base.metadata.tables):
+        console.print(f"  - {name}")
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def ingest(
+    timeframe: list[str] = typer.Option(None, "--timeframe", "-t"),
+    no_prune: bool = typer.Option(False, "--no-prune"),
+) -> None:
+    """Sync candles from Binance into the database."""
+    from .jobs.ingest import ingest_candles
+
+    result = ingest_candles(
+        timeframes=tuple(timeframe) if timeframe else None, prune=not no_prune
+    )
+    console.print(f"[green]Ingest:[/green] {result.describe()}")
+    for symbol, tf, error in result.failures:
+        console.print(f"  [red]{symbol} {tf}[/red]: {error}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("analyse")
+def analyse(
+    force: bool = typer.Option(False, "--force", help="Re-run an already-analysed bar"),
+    no_notify: bool = typer.Option(False, "--no-notify"),
+    skip_ingest: bool = typer.Option(False, "--skip-ingest"),
+) -> None:
+    """Run one full analysis cycle."""
+    from .jobs.analyze import run_cycle
+    from .jobs.ingest import ingest_candles
+
+    settings = get_settings()
+    console.print(
+        f"[bold]mode:[/bold] {settings.trading_mode.value} | "
+        f"live orders: {'YES' if settings.can_place_real_orders else 'no'}"
+    )
+
+    if not skip_ingest:
+        ingest_candles()
+
+    result = run_cycle(settings=settings, trigger="manual", force=force, notify=not no_notify)
+    if result.skipped_reason:
+        console.print(f"[yellow]{result.skipped_reason}[/yellow]")
+        return
+
+    console.print(f"[green]Cycle:[/green] {result.describe()}")
+    for error in result.errors:
+        console.print(f"  [red]error[/red]: {error}")
+
+
+@app.command()
+def monitor(no_notify: bool = typer.Option(False, "--no-notify")) -> None:
+    """Reconcile positions against the venue and check circuit breakers."""
+    from .jobs.monitor import run_monitor, snapshot_account
+
+    snapshot_account()
+    result = run_monitor(notify=not no_notify)
+    console.print(f"[green]Monitor:[/green] {result.describe()}")
+    for alert in result.alerts:
+        console.print(f"  [red]ALERT[/red]: {alert}")
+    if result.breaker_tripped:
+        console.print(f"  [red]BREAKER[/red]: {result.breaker_tripped}")
+
+
+@app.command("refresh-specs")
+def refresh_specs() -> None:
+    """Refresh cached WEEX contract minimums."""
+    from .jobs.ingest import refresh_contract_specs
+
+    count = refresh_contract_specs(use_cache=False)
+    if count:
+        console.print(f"[green]Cached {count} contract specs[/green]")
+    else:
+        console.print("[yellow]Could not reach WEEX; existing cache retained[/yellow]")
+        raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Safety
+# ---------------------------------------------------------------------------
+
+
+@app.command("verify-credentials")
+def verify_credentials() -> None:
+    """Prove the WEEX signing scheme works. Required before live trading.
+
+    The authentication format in this codebase is inferred from the OKX/Bitget
+    convention, not confirmed against reachable documentation. This command
+    tries each variant against a read-only endpoint so a mismatch surfaces
+    harmlessly instead of on an order.
+    """
+    from .exchanges.weex_private import WeexTradingClient
+
+    settings = get_settings()
+    with WeexTradingClient(
+        api_key=_secret(settings.weex_api_key),
+        api_secret=_secret(settings.weex_api_secret),
+        api_passphrase=_secret(settings.weex_api_passphrase),
+    ) as client:
+        if not client.has_credentials:
+            console.print("[red]WEEX credentials are not set in the environment[/red]")
+            raise typer.Exit(code=1)
+
+        ok, detail = client.verify_credentials()
+        if ok:
+            console.print(f"[green]Credentials verified:[/green] {detail}")
+            equity = client.account_equity()
+            console.print(f"Account equity: {equity if equity is not None else 'unknown'}")
+        else:
+            console.print(f"[red]Verification failed[/red]\n{detail}")
+            console.print(
+                "\n[yellow]Live trading will refuse to place orders until this "
+                "passes.[/yellow] The signing scheme may differ from the assumed "
+                "one; the variants tried are in exchanges/weex_private.py."
+            )
+            raise typer.Exit(code=1)
+
+
+@app.command("clear-breaker")
+def clear_breaker() -> None:
+    """Manually clear an active circuit breaker."""
+    from .db.engine import session_scope
+    from .db.repo import CircuitBreakerRepo
+
+    with session_scope() as session:
+        repo = CircuitBreakerRepo(session)
+        active = repo.active()
+        if active is None:
+            console.print("No active circuit breaker")
+            return
+        console.print(f"[yellow]Active:[/yellow] {active.reason} - {active.detail}")
+        if not typer.confirm("Clear it?"):
+            raise typer.Abort()
+        count = repo.clear_all()
+    console.print(f"[green]Cleared {count} breaker(s)[/green]")
+
+
+@app.command("close-position")
+def close_position(
+    symbol: str = typer.Argument(..., help="e.g. BTCUSDT"),
+    reason: str = typer.Option("manual", "--reason"),
+) -> None:
+    """Close an open position at market."""
+    from .config import load_universe
+    from .db.engine import session_scope
+    from .db.repo import PositionRepo
+    from .execution.engine import ExecutionEngine
+    from .jobs.analyze import _build_venue
+
+    settings = get_settings()
+    with session_scope() as session:
+        position = PositionRepo(session).open_for_symbol(symbol.upper())
+        if position is None:
+            console.print(f"[yellow]No open position in {symbol}[/yellow]")
+            raise typer.Exit(code=1)
+
+        console.print(
+            f"{position.side} {position.quantity} {position.symbol} @ {position.entry_price}"
+        )
+        if not typer.confirm(f"Close it at market ({'LIVE' if not position.is_paper else 'paper'})?"):
+            raise typer.Abort()
+
+        engine = ExecutionEngine(
+            session=session, venue=_build_venue(settings, load_universe())
+        )
+        report = engine.close_position(position, reason=reason)
+
+    console.print(
+        f"[{'green' if report.ok else 'red'}]{report.detail}[/]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inspection
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def status() -> None:
+    """Account, open positions and the last few runs."""
+    from .db.engine import session_scope
+    from .db.repo import AccountRepo, CircuitBreakerRepo, PositionRepo, RunRepo
+
+    settings = get_settings()
+    console.print(
+        f"[bold]environment[/bold] {settings.environment.value} | "
+        f"[bold]mode[/bold] {settings.trading_mode.value} | "
+        f"[bold]live orders[/bold] {'YES' if settings.can_place_real_orders else 'no'}"
+    )
+
+    with session_scope() as session:
+        account = AccountRepo(session).latest()
+        breaker = CircuitBreakerRepo(session).active()
+        positions = PositionRepo(session).open_positions()
+        closed = PositionRepo(session).recent_closed(limit=10)
+        runs = RunRepo(session).recent(limit=5)
+
+        if account is not None:
+            console.print(
+                f"\nequity [bold]{account.equity}[/bold] USDT "
+                f"(recorded {account.at:%Y-%m-%d %H:%M} UTC)"
+            )
+        if breaker is not None:
+            console.print(
+                f"[red]CIRCUIT BREAKER ACTIVE[/red]: {breaker.reason} - "
+                f"{breaker.detail} (until {breaker.halted_until:%Y-%m-%d %H:%M} UTC)"
+            )
+
+        if positions:
+            table = Table(title="Open positions")
+            for column in ("symbol", "side", "qty", "entry", "stop", "stop@venue", "paper"):
+                table.add_column(column)
+            for position in positions:
+                table.add_row(
+                    position.symbol,
+                    position.side,
+                    str(position.quantity),
+                    str(position.entry_price),
+                    str(position.stop_price),
+                    "[green]yes[/green]" if position.stop_order_id else "[red]NO[/red]",
+                    "yes" if position.is_paper else "[red]LIVE[/red]",
+                )
+            console.print(table)
+        else:
+            console.print("\nno open positions")
+
+        if closed:
+            wins = sum(1 for p in closed if (p.realised_pnl or 0) > 0)
+            total_r = sum((p.r_multiple or Decimal("0")) for p in closed)
+            console.print(
+                f"\nlast {len(closed)} closed: {wins} wins, "
+                f"{len(closed)-wins} losses, total {total_r:+.2f}R"
+            )
+
+        if runs:
+            table = Table(title="Recent runs")
+            for column in ("started", "trigger", "bar", "ok", "scanned", "approved"):
+                table.add_column(column)
+            for run in runs:
+                table.add_row(
+                    f"{run.started_at:%m-%d %H:%M}",
+                    run.trigger,
+                    f"{run.bar_time:%m-%d %H:%M}" if run.bar_time else "-",
+                    "[green]yes[/green]" if run.ok else "[red]no[/red]",
+                    str(run.symbols_scanned),
+                    str(run.signals_approved),
+                )
+            console.print(table)
+
+
+@app.command()
+def journal(
+    limit: int = typer.Option(20, "--limit", "-n"),
+    symbol: str = typer.Option(None, "--symbol", "-s"),
+    days: int = typer.Option(None, "--days", "-d"),
+) -> None:
+    """Recent signals and why each was approved or rejected."""
+    from .db.engine import session_scope
+    from .db.repo import SignalRepo
+
+    since = (
+        datetime.now(tz=UTC) - timedelta(days=days) if days else None
+    )
+    with session_scope() as session:
+        signals = SignalRepo(session).recent(
+            limit=limit, symbol=symbol.upper() if symbol else None, since=since
+        )
+
+        if not signals:
+            console.print("no signals recorded")
+            return
+
+        table = Table(title=f"Journal ({len(signals)} signals)")
+        for column in ("bar", "symbol", "side", "status", "score", "R:R", "detail"):
+            table.add_column(column, overflow="fold")
+
+        for signal in signals:
+            detail = ""
+            if signal.vetoes:
+                rules = signal.vetoes.get("rules") or []
+                if rules:
+                    detail = "; ".join(rule.get("rule", "") for rule in rules[:2])
+                elif signal.vetoes.get("setup"):
+                    detail = str(signal.vetoes["setup"])[:70]
+                elif signal.vetoes.get("blockers"):
+                    detail = "; ".join(signal.vetoes["blockers"])[:70]
+            elif signal.reasons:
+                top = signal.reasons.get("top") or []
+                detail = top[0][:70] if top else ""
+
+            colour = {
+                "approved": "green",
+                "executed": "bold green",
+                "rejected_risk": "yellow",
+                "candidate": "dim",
+            }.get(signal.status, "white")
+
+            table.add_row(
+                f"{signal.bar_time:%m-%d %H:%M}",
+                signal.symbol,
+                signal.side,
+                f"[{colour}]{signal.status}[/{colour}]",
+                f"{signal.score:+.3f}" if signal.score is not None else "-",
+                f"{signal.risk_reward:.2f}" if signal.risk_reward is not None else "-",
+                detail,
+            )
+        console.print(table)
+
+
+@app.command()
+def doctor() -> None:
+    """Check the deployment is wired up correctly.
+
+    Run this first after deploying. It verifies the things that actually break
+    in practice rather than the things that are easy to check.
+    """
+    settings = get_settings()
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    console.print("[bold]Configuration[/bold]")
+    console.print(f"  environment      {settings.environment.value}")
+    console.print(f"  trading mode     {settings.trading_mode.value}")
+    console.print(f"  live orders      {'YES' if settings.can_place_real_orders else 'no'}")
+
+    # --- database ---------------------------------------------------------
+    if settings.database_url is None:
+        problems.append("DATABASE_URL is not set")
+        console.print("  database         [red]not configured[/red]")
+    else:
+        url = settings.require_database_url()
+        pooled = "-pooler" in url
+        console.print(
+            f"  database         configured ({'pooled' if pooled else 'DIRECT'})"
+        )
+        if not pooled:
+            warnings.append(
+                "DATABASE_URL is the direct endpoint. Use the '-pooler' host for "
+                "the app: Neon's free compute suspends after 5 idle minutes and "
+                "the pooler absorbs the reconnect."
+            )
+        try:
+            from sqlalchemy import text
+
+            from .db.engine import get_engine
+
+            with get_engine().connect() as conn:
+                version = conn.execute(text("SELECT version()")).scalar_one()
+            console.print(f"  connection       [green]ok[/green] ({str(version)[:40]})")
+
+            from sqlalchemy import inspect
+
+            from .db.schema import Base
+
+            existing = set(inspect(get_engine()).get_table_names())
+            missing = set(Base.metadata.tables) - existing
+            if missing:
+                problems.append(
+                    f"missing tables: {', '.join(sorted(missing))}. Run `tradingbot init-db`."
+                )
+            else:
+                console.print(f"  schema           [green]all {len(Base.metadata.tables)} tables present[/green]")
+        except Exception as exc:
+            problems.append(f"cannot connect to the database: {exc}")
+            console.print(f"  connection       [red]failed[/red]: {exc}")
+
+    # --- config files -----------------------------------------------------
+    try:
+        from .config import load_risk, load_universe
+
+        universe = load_universe()
+        risk = load_risk()
+        console.print(
+            f"  universe         {len(universe.symbols)} symbols, "
+            f"primary {universe.primary_timeframe}"
+        )
+
+        # The config contradiction found during development: a symbol whose own
+        # beta exceeds the portfolio cap can never be traded at all.
+        cap = risk.decimal("portfolio", "max_portfolio_btc_beta", default="2.0")
+        unreachable = [
+            config.symbol
+            for config in universe.symbols
+            if config.tier.tradeable and risk.beta_to_btc(config.symbol) > cap
+        ]
+        if unreachable:
+            warnings.append(
+                f"these symbols can NEVER trade: {', '.join(unreachable)}. Their "
+                f"configured beta_to_btc exceeds max_portfolio_btc_beta ({cap}), "
+                "so the gate vetoes them even on an empty book."
+            )
+    except Exception as exc:
+        problems.append(f"config failed to load: {exc}")
+
+    # --- credentials ------------------------------------------------------
+    if settings.trading_mode is TradingMode.LIVE:
+        from .exchanges.weex_private import WeexTradingClient
+
+        with WeexTradingClient(
+            api_key=_secret(settings.weex_api_key),
+            api_secret=_secret(settings.weex_api_secret),
+            api_passphrase=_secret(settings.weex_api_passphrase),
+        ) as client:
+            ok, detail = client.verify_credentials()
+            if ok:
+                console.print(f"  WEEX auth        [green]verified[/green] ({detail})")
+            else:
+                problems.append(f"WEEX credentials failed verification: {detail}")
+    else:
+        console.print("  WEEX auth        not required in this mode")
+
+    if settings.telegram_bot_token and settings.telegram_chat_id:
+        console.print("  telegram         configured")
+    else:
+        warnings.append("Telegram is not configured; signals will only be journaled")
+
+    # --- verdict ----------------------------------------------------------
+    console.print()
+    for warning in warnings:
+        console.print(f"[yellow]warning[/yellow] {warning}")
+    for problem in problems:
+        console.print(f"[red]problem[/red] {problem}")
+
+    if problems:
+        console.print(f"\n[red]{len(problems)} problem(s) found[/red]")
+        raise typer.Exit(code=1)
+    console.print("\n[green]Deployment looks healthy[/green]")
+
+
+def _secret(value) -> str | None:
+    return value.get_secret_value() if value is not None else None
+
+
+if __name__ == "__main__":
+    app()

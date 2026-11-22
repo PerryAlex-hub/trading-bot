@@ -18,14 +18,14 @@ analysis modules individually. `universe.yaml` declares 4h as primary with 1d,
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping, Sequence
 
 import pandas as pd
 
 from ..models import Candle, Tier, Timeframe
-from .confluence import ConfluenceEngine, ConfluenceResult
+from .confluence import ConfluenceEngine
 from .frame import check_health, to_frame
 from .levels import build_levels
 from .patterns import (
@@ -33,7 +33,7 @@ from .patterns import (
     detect_chart_patterns,
     detect_divergence,
 )
-from .regime import BetaEstimate, MarketRegime, assess_regime, estimate_beta
+from .regime import MarketRegime, assess_regime, estimate_beta
 from .snapshot import FeatureSnapshot, TimeframeView, build_snapshot, build_timeframe_view
 from .structure import classify_structure
 

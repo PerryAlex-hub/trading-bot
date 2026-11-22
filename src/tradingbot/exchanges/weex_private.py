@@ -35,7 +35,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -51,7 +51,7 @@ from ..models import (
     Side,
 )
 from .base import CredentialsNotVerified, VenueError, VenuePosition
-from .weex import BASE_URL, WeexClient, WeexEndpointError, _first, _to_decimal, _unwrap
+from .weex import WeexClient, WeexEndpointError, _first, _to_decimal, _unwrap
 
 log = logging.getLogger(__name__)
 
@@ -254,7 +254,7 @@ class WeexTradingClient(WeexClient):
             return None
 
         return Quote(
-            symbol=symbol, bid=bid, ask=ask, mark=mark, at=datetime.now(tz=timezone.utc)
+            symbol=symbol, bid=bid, ask=ask, mark=mark, at=datetime.now(tz=UTC)
         )
 
     def _quote_from_depth(self, symbol: str, mark: Decimal | None) -> Quote | None:
@@ -283,7 +283,7 @@ class WeexTradingClient(WeexClient):
             bid=bid,
             ask=ask,
             mark=mark or (bid + ask) / 2,
-            at=datetime.now(tz=timezone.utc),
+            at=datetime.now(tz=UTC),
         )
 
     def funding(self, symbol: str) -> FundingInfo | None:

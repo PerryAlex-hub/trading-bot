@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Crypto signal-analysis bot: deterministic feature engine + LLM reasoning layer, signals only."
 requires-python = ">=3.11"
 
+[project.scripts]
+tradingbot = "tradingbot.cli:app"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -11,6 +14,25 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+tradingbot = ["resources/config/*.yaml"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 95
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # FastAPI's Depends() in defaults is the documented idiom
+    # `str, Enum` is deliberate over StrEnum: these values are persisted to
+    # Postgres and serialised into the journal's JSON, and StrEnum changes
+    # what str() returns, which would silently alter stored data.
+    "UP042",
+]

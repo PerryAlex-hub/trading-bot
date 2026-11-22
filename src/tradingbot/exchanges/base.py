@@ -12,7 +12,7 @@ interchangeable without inheritance, and so tests can substitute a plain stub.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ..models import (
     Candle,

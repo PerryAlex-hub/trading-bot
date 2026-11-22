@@ -24,18 +24,15 @@ overhead. A high score cannot buy its way past one.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
 
 import pandas as pd
 
 from ..models import Side, Trend
 from .indicators import (
-    adx,
     atr,
     atr_pct,
     bollinger,
-    ema,
     macd,
     mfi,
     relative_volume,

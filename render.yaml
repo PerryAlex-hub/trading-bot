@@ -1,0 +1,41 @@
+# Render blueprint for the read-only API.
+#
+# Free-tier facts this is built around:
+#   * 750 instance-hours/month per workspace, enough for ONE always-available
+#     service (a 31-day month is 744 hours).
+#   * A free web service spins down after 15 minutes idle and takes ~1 minute
+#     to wake.
+#
+# The cold start is acceptable because this API is NOT on the trading path:
+# GitHub Actions runs the jobs and Telegram pushes the signals. This service
+# only reads the journal, so it being asleep costs nothing but a slow first
+# page load.
+#
+# Deliberately NOT a background worker: those are paid-only on Render.
+
+services:
+  - type: web
+    name: tradingbot-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      # Read-only service. Hardcoded rather than inherited so no deploy
+      # setting can ever arm the API to place orders.
+      - key: TRADING_MODE
+        value: signal_only
+      - key: LIVE_TRADING_ENABLED
+        value: "false"
+      - key: CONFIG_DIR
+        value: /app/config
+      - key: LOG_LEVEL
+        value: INFO
+      # Set in the Render dashboard, not here: this file is committed.
+      # Use the POOLED Neon string (the host containing '-pooler').
+      - key: DATABASE_URL
+        sync: false

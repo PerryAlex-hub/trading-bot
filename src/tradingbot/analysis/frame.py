@@ -18,10 +18,10 @@ inexplicable backtest result.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
-from typing import Sequence
 
 import pandas as pd
 

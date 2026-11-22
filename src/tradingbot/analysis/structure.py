@@ -15,9 +15,10 @@ reading the future. Every swing here carries `confirmed_at`, and
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, Sequence
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -237,7 +238,8 @@ def classify_structure(
 def _count_sequence(swings: Sequence[Swing]) -> tuple[int, int]:
     """Count rising vs falling steps in a run of same-type swings."""
     rising = falling = 0
-    for previous, current in zip(swings, swings[1:]):
+    # Pairwise walk: the slice is one shorter by design, so strict= is wrong here.
+    for previous, current in zip(swings, swings[1:]):  # noqa: B905
         if current.price > previous.price:
             rising += 1
         elif current.price < previous.price:
@@ -287,6 +289,24 @@ def _classify_trend(
     bullish = higher_highs + higher_lows
     bearish = lower_highs + lower_lows
     organised = adx_value is not None and adx_value >= 25.0
+
+    # No swing evidence at all. This is NOT a range - it is most often the
+    # opposite. A near-vertical move makes no fractal pivots, because no bar
+    # has lower highs on both sides of it, so the swing sequence is empty
+    # exactly when the trend is strongest. Falling through to RANGE here meant
+    # a parabolic rally with ADX 99 was labelled "range", which zeroed the
+    # trend contribution, disarmed the strong-trend blockers and re-enabled
+    # the mean-reversion check that is supposed to switch itself off in a
+    # trend. Caught by test_strong_uptrend_is_detected.
+    #
+    # With no structure to read, the EMA stack and ADX are the only available
+    # evidence, so they decide.
+    if bullish == 0 and bearish == 0:
+        if stack == "bullish":
+            return Trend.STRONG_UP if organised else Trend.UP
+        if stack == "bearish":
+            return Trend.STRONG_DOWN if organised else Trend.DOWN
+        return Trend.RANGE
 
     if bullish > bearish + 1 and stack == "bullish" and organised:
         return Trend.STRONG_UP

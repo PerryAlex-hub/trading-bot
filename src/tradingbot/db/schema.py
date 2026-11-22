@@ -19,7 +19,7 @@ Money and prices are NUMERIC, never float. Timestamps are all timezone-aware.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -60,7 +60,7 @@ PK = BigInteger().with_variant(Integer, "sqlite")
 
 
 def utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 class Base(DeclarativeBase):

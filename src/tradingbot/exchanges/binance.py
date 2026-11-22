@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import InvalidOperation
 from typing import Any
 
@@ -143,7 +143,7 @@ class BinanceHistory:
         if not candles:
             return candles
         seconds = _interval_seconds(interval)
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         last = candles[-1]
         if (now - last.open_time).total_seconds() < seconds:
             return candles[:-1]

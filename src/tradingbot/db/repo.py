@@ -13,12 +13,14 @@ duplicates.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from ..models import Candle as CandleValue
@@ -91,20 +93,32 @@ class CandleRepo:
             for candle in candles
         ]
 
+        # Dialect-aware so the suite can exercise ingest end-to-end on
+        # in-memory SQLite. Both dialects support ON CONFLICT DO UPDATE, but
+        # they are different constructs and SQLite needs the index columns
+        # rather than a named constraint.
+        dialect = self.session.get_bind().dialect.name
+        insert = sqlite_insert if dialect == "sqlite" else pg_insert
+
         for start in range(0, len(rows), _UPSERT_CHUNK):
             chunk = rows[start : start + _UPSERT_CHUNK]
-            statement = pg_insert(Candle).values(chunk)
-            statement = statement.on_conflict_do_update(
-                constraint="uq_candle_bar",
-                set_={
-                    "open": statement.excluded.open,
-                    "high": statement.excluded.high,
-                    "low": statement.excluded.low,
-                    "close": statement.excluded.close,
-                    "volume": statement.excluded.volume,
-                    "source": statement.excluded.source,
-                },
-            )
+            statement = insert(Candle).values(chunk)
+            updates = {
+                "open": statement.excluded.open,
+                "high": statement.excluded.high,
+                "low": statement.excluded.low,
+                "close": statement.excluded.close,
+                "volume": statement.excluded.volume,
+                "source": statement.excluded.source,
+            }
+            if dialect == "sqlite":
+                statement = statement.on_conflict_do_update(
+                    index_elements=["symbol", "timeframe", "open_time"], set_=updates
+                )
+            else:
+                statement = statement.on_conflict_do_update(
+                    constraint="uq_candle_bar", set_=updates
+                )
             self.session.execute(statement)
             written += len(chunk)
 
@@ -203,7 +217,7 @@ class CandleRepo:
         if open_time.tzinfo is None:
             # SQLite loses tzinfo on round-trip; Postgres does not. Normalising
             # here keeps the analysis layer free of storage-engine quirks.
-            open_time = open_time.replace(tzinfo=timezone.utc)
+            open_time = open_time.replace(tzinfo=UTC)
         return CandleValue(
             open_time=open_time,
             open=row.open,
@@ -809,5 +823,5 @@ class ContractSpecRepo:
             return None
         fetched = row.fetched_at
         if fetched.tzinfo is None:
-            fetched = fetched.replace(tzinfo=timezone.utc)
+            fetched = fetched.replace(tzinfo=UTC)
         return (utcnow() - fetched).total_seconds() / 3600

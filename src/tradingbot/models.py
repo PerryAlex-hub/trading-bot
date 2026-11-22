@@ -7,7 +7,7 @@ for indicators, not for deciding how much of an asset to buy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -31,7 +31,7 @@ class Side(str, Enum):
     FLAT = "flat"
 
     @property
-    def opposite(self) -> "Side":
+    def opposite(self) -> Side:
         if self is Side.LONG:
             return Side.SHORT
         if self is Side.SHORT:
@@ -63,7 +63,7 @@ class Candle:
         """Build from the common [ts_ms, o, h, l, c, v] ordering."""
         ts_ms, o, h, low, c, v = row[:6]
         return cls(
-            open_time=datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc),
+            open_time=datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC),
             open=Decimal(str(o)),
             high=Decimal(str(h)),
             low=Decimal(str(low)),

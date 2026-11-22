@@ -1,0 +1,358 @@
+"""Risk sizing and the veto gate.
+
+This is the layer `risk.yaml` grants authority over everything else, so these
+tests assert the economics directly: that risk never exceeds the budget, that
+leverage changes margin and nothing else, and that every rule actually bites.
+
+The gate is also asserted to **fail closed**. A risk check that silently
+permits a trade when its input is missing is worse than no check at all.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from decimal import Decimal
+
+import pytest
+
+from tradingbot.config import load_risk
+from tradingbot.models import (
+    ContractSpec,
+    FundingInfo,
+    Quote,
+    Side,
+    Tier,
+    TradeSetup,
+)
+from tradingbot.risk import (
+    PortfolioState,
+    RiskGate,
+    friction_cost,
+    net_risk_reward,
+    size_position,
+)
+
+
+def quote(symbol: str, bid: str, ask: str, mark: str) -> Quote:
+    return Quote(
+        symbol=symbol,
+        bid=Decimal(bid),
+        ask=Decimal(ask),
+        mark=Decimal(mark),
+        at=dt.datetime.now(dt.UTC),
+    )
+
+
+@pytest.fixture
+def btc_long() -> TradeSetup:
+    return TradeSetup(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        entry=Decimal("92000"),
+        stop=Decimal("89200"),
+        targets=(Decimal("97600"),),
+    )
+
+
+@pytest.fixture
+def risk_config():
+    return load_risk()
+
+
+class TestTradeSetup:
+    def test_long_stop_must_sit_below_entry(self) -> None:
+        with pytest.raises(ValueError, match="must sit below"):
+            TradeSetup("X", Side.LONG, Decimal("100"), Decimal("110"), (Decimal("120"),))
+
+    def test_short_stop_must_sit_above_entry(self) -> None:
+        with pytest.raises(ValueError, match="must sit above"):
+            TradeSetup("X", Side.SHORT, Decimal("100"), Decimal("90"), (Decimal("80"),))
+
+    def test_a_setup_needs_at_least_one_target(self) -> None:
+        with pytest.raises(ValueError, match="at least one target"):
+            TradeSetup("X", Side.LONG, Decimal("100"), Decimal("90"), ())
+
+    def test_risk_reward_arithmetic(self, btc_long: TradeSetup) -> None:
+        assert btc_long.risk_per_unit == Decimal("2800")
+        assert btc_long.reward_per_unit() == Decimal("5600")
+        assert btc_long.risk_reward() == Decimal("2")
+
+    def test_is_favourable_guards_against_chasing(self, btc_long: TradeSetup) -> None:
+        """A cron firing late must not buy a move it already missed."""
+        assert btc_long.is_favourable(Decimal("91000"))
+        assert not btc_long.is_favourable(Decimal("93000"))
+
+
+class TestSizing:
+    def test_risk_never_exceeds_the_budget(self, btc_long, btc_spec) -> None:
+        """The single most important invariant in the project."""
+        size = size_position(
+            btc_long, equity=Decimal("200"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec,
+        )
+        assert size.viable
+        budget = Decimal("200") * Decimal("0.5") / Decimal("100")
+        assert size.quantity * btc_long.risk_per_unit <= budget
+
+    @pytest.mark.parametrize("max_leverage", [1, 5, 10, 50])
+    def test_leverage_changes_margin_not_risk(
+        self, btc_long, btc_spec, max_leverage: int
+    ) -> None:
+        """Conflating leverage with risk is how small accounts die."""
+        size = size_position(
+            btc_long, equity=Decimal("200"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec, max_leverage=max_leverage,
+        )
+        if size.viable:
+            risked = size.quantity * btc_long.risk_per_unit
+            assert risked <= Decimal("1.0")
+
+    def test_satellite_tier_is_sized_at_half(self, btc_spec) -> None:
+        setup = TradeSetup(
+            "DOGEUSDT", Side.LONG, Decimal("0.40"), Decimal("0.38"), (Decimal("0.46"),)
+        )
+        spec = ContractSpec(
+            "DOGEUSDT", min_order_size=Decimal("1"), size_step=Decimal("1"),
+            min_notional=Decimal("5"),
+        )
+        core = size_position(
+            setup, equity=Decimal("1000"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=spec,
+        )
+        satellite = size_position(
+            setup, equity=Decimal("1000"), risk_pct=Decimal("0.5"),
+            tier=Tier.SATELLITE, spec=spec, satellite_multiplier=Decimal("0.5"),
+        )
+        assert satellite.risk_amount == core.risk_amount / 2
+
+    def test_venue_minimum_refuses_rather_than_overrisking(self, goat_spec) -> None:
+        """The small-account floor. Must refuse, never round up."""
+        setup = TradeSetup(
+            "GOATUSDT", Side.LONG, Decimal("0.52"), Decimal("0.44"), (Decimal("0.70"),)
+        )
+        size = size_position(
+            setup, equity=Decimal("200"), risk_pct=Decimal("0.5"),
+            tier=Tier.SATELLITE, spec=goat_spec,
+        )
+        assert not size.viable
+        assert "below the venue minimum" in size.reason
+        # The refusal must explain what would be needed.
+        assert "equity" in size.reason
+
+    def test_quantity_rounds_down_to_the_venue_step(self, btc_long, btc_spec) -> None:
+        """Rounding up would risk more than the gate approved."""
+        size = size_position(
+            btc_long, equity=Decimal("200"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec,
+        )
+        assert size.quantity % btc_spec.size_step == 0
+
+    def test_zero_equity_is_refused(self, btc_long, btc_spec) -> None:
+        size = size_position(
+            btc_long, equity=Decimal("0"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec,
+        )
+        assert not size.viable
+
+    def test_margin_cap_prevents_one_trade_eating_the_account(self, btc_spec) -> None:
+        setup = TradeSetup(
+            "BTCUSDT", Side.LONG, Decimal("92000"), Decimal("91990"), (Decimal("92100"),)
+        )
+        size = size_position(
+            setup, equity=Decimal("200"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec, max_leverage=1,
+            max_margin_fraction=Decimal("0.5"),
+        )
+        # A 10-point stop implies an enormous position; it must be refused.
+        assert not size.viable
+
+
+class TestFriction:
+    def test_friction_reduces_risk_reward(self, btc_long, btc_spec) -> None:
+        size = size_position(
+            btc_long, equity=Decimal("10000"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec,
+        )
+        friction = friction_cost(
+            notional=size.notional, taker_fee_pct=Decimal("0.06"),
+            spread_pct=Decimal("0.05"), funding_rate_8h_pct=Decimal("0.01"),
+            hold_intervals=6,
+        )
+        assert friction > 0
+        assert net_risk_reward(btc_long, size, friction) < btc_long.risk_reward()
+
+    def test_zero_friction_leaves_risk_reward_unchanged(self, btc_long, btc_spec) -> None:
+        size = size_position(
+            btc_long, equity=Decimal("10000"), risk_pct=Decimal("0.5"),
+            tier=Tier.CORE, spec=btc_spec,
+        )
+        net = net_risk_reward(btc_long, size, Decimal("0"))
+        assert net == pytest.approx(float(btc_long.risk_reward()), rel=1e-9)
+
+
+class TestRiskGate:
+    def test_a_clean_setup_with_no_friction_passes(self, risk_config, btc_spec) -> None:
+        """Generous geometry so only the rules under test can fail it."""
+        setup = TradeSetup(
+            "BTCUSDT", Side.LONG, Decimal("92000"), Decimal("89200"),
+            (Decimal("103200"),),  # 4:1 gross, survives friction
+        )
+        decision = RiskGate(risk_config).evaluate(
+            setup,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(
+                equity=Decimal("10000"), equity_at_day_start=Decimal("10000")
+            ),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+        )
+        assert decision.approved, decision.veto_summary
+        assert decision.size is not None
+
+    def test_missing_quote_fails_closed(self, risk_config, btc_spec, btc_long) -> None:
+        """Unknown must never mean permitted."""
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("200")),
+            spec=btc_spec,
+            quote=None,
+            funding=None,
+            require_market_data=True,
+        )
+        assert not decision.approved
+        assert any(veto.rule == "costs.spread_unknown" for veto in decision.vetoes)
+
+    def test_wide_spread_is_vetoed(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("200")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91700", "92300", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.01")),
+        )
+        assert any(veto.rule == "costs.max_spread_pct" for veto in decision.vetoes)
+
+    def test_excessive_funding_is_vetoed(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("200")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.5")),
+        )
+        assert any(
+            veto.rule == "costs.max_abs_funding_rate_8h" for veto in decision.vetoes
+        )
+
+    def test_paper_tier_is_never_sized(self, risk_config) -> None:
+        """universe.yaml says AXISUSDT is journaled but never traded."""
+        setup = TradeSetup(
+            "AXISUSDT", Side.LONG, Decimal("1.15"), Decimal("1.00"), (Decimal("1.60"),)
+        )
+        decision = RiskGate(risk_config).evaluate(
+            setup,
+            tier=Tier.PAPER,
+            portfolio=PortfolioState(equity=Decimal("200")),
+            spec=ContractSpec("AXISUSDT", size_step=Decimal("1"), min_notional=Decimal("5")),
+            quote=quote("AXISUSDT", "1.149", "1.151", "1.15"),
+            funding=FundingInfo("AXISUSDT", Decimal("0.01")),
+            history_days=30,
+        )
+        assert not decision.approved
+        assert any(veto.rule == "tier.not_tradeable" for veto in decision.vetoes)
+
+    def test_consecutive_losses_trip_the_breaker(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("200"), consecutive_losses=4),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.01")),
+        )
+        assert any(
+            veto.rule == "circuit_breakers.max_consecutive_losses"
+            for veto in decision.vetoes
+        )
+
+    def test_daily_loss_limit_is_enforced(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(
+                equity=Decimal("190"),
+                equity_at_day_start=Decimal("200"),
+                realised_pnl_today=Decimal("-10"),
+            ),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.01")),
+        )
+        assert any(
+            veto.rule == "circuit_breakers.max_daily_loss_pct"
+            for veto in decision.vetoes
+        )
+
+    def test_price_drift_between_venues_is_vetoed(self, risk_config, btc_spec, btc_long) -> None:
+        """The signal came from Binance but executes on WEEX."""
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("200")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "85000", "85010", "85005"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.01")),
+        )
+        assert any(veto.rule == "costs.price_drift" for veto in decision.vetoes)
+
+    def test_all_failing_rules_are_reported_not_just_the_first(
+        self, risk_config, btc_spec, btc_long
+    ) -> None:
+        """A journal that records one reason loses most of its diagnostic value."""
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(
+                equity=Decimal("190"),
+                consecutive_losses=4,
+                equity_at_day_start=Decimal("200"),
+                realised_pnl_today=Decimal("-10"),
+            ),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91700", "92300", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.5")),
+        )
+        assert len(decision.vetoes) >= 4
+        rules = {veto.rule for veto in decision.vetoes}
+        assert "circuit_breakers.max_consecutive_losses" in rules
+        assert "costs.max_spread_pct" in rules
+
+
+class TestConfigContradiction:
+    def test_beta_cap_makes_some_configured_symbols_unreachable(self, risk_config) -> None:
+        """Documents a real contradiction found in the shipped risk.yaml.
+
+        GOATUSDT and AXISUSDT carry beta_to_btc 2.5 while
+        max_portfolio_btc_beta is 2.0, so each exceeds the whole portfolio
+        budget by itself and can never be traded, even on an empty book.
+
+        This test asserts the GATE behaves consistently with the config, not
+        that the config is correct. If the cap is raised or the betas lowered,
+        this test is expected to fail and should be updated - that is the
+        point of pinning it.
+        """
+        from tradingbot.config import load_universe
+
+        cap = risk_config.decimal("portfolio", "max_portfolio_btc_beta", default="2.0")
+        unreachable = [
+            config.symbol
+            for config in load_universe().symbols
+            if config.tier.tradeable and risk_config.beta_to_btc(config.symbol) > cap
+        ]
+        assert "GOATUSDT" in unreachable, (
+            "risk.yaml appears to have changed; update this test and the README note"
+        )

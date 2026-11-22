@@ -15,11 +15,30 @@ from typing import Any
 
 import yaml
 
+from .models import SymbolConfig, Tier
+from .settings import get_settings
+
+# Kept for backwards compatibility with Phase 0 call sites. Do NOT rely on these
+# in deployed code: in a container the package is installed rather than checked
+# out, so there is no project root above it and no writable data directory.
+# `config_dir()` is the supported accessor.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
 
-from .models import SymbolConfig, Tier  # noqa: E402  (after PROJECT_ROOT for clarity)
+
+def config_dir() -> Path:
+    """Where universe.yaml and risk.yaml live.
+
+    Resolved through settings so the location is an environment variable in
+    production (`CONFIG_DIR`) and a repo-relative path locally. Hardcoding a
+    path relative to the source tree is the single most common reason a bot
+    that works locally dies on first deploy.
+    """
+    return get_settings().resolved_config_dir()
+
+
+# Module-level alias, resolved lazily on first use by the loaders below.
+CONFIG_DIR = PROJECT_ROOT / "config"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -79,7 +98,7 @@ def _parse_symbol(raw: dict[str, Any], default_tier: Tier) -> SymbolConfig:
 
 @lru_cache(maxsize=1)
 def load_universe(path: Path | None = None) -> Universe:
-    data = _load_yaml(path or CONFIG_DIR / "universe.yaml")
+    data = _load_yaml(path or config_dir() / "universe.yaml")
     timeframes = data.get("timeframes", {}) or {}
     return Universe(
         quote=str(data.get("quote", "USDT")),
@@ -144,7 +163,7 @@ class RiskConfig:
 
 @lru_cache(maxsize=1)
 def load_risk(path: Path | None = None) -> RiskConfig:
-    return RiskConfig(raw=_load_yaml(path or CONFIG_DIR / "risk.yaml"))
+    return RiskConfig(raw=_load_yaml(path or config_dir() / "risk.yaml"))
 
 
 def live_trading_enabled() -> bool:
