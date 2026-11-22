@@ -1,0 +1,59 @@
+# Trading universe.
+#
+# Tiers:
+#   core    - deep liquidity, long history. Tradeable. Also used to read market regime.
+#   satellite - user-selected higher-beta names. Tradeable with reduced size.
+#   paper   - signals generated and journaled, but NEVER sized for live execution.
+#             Auto-promotable to satellite once min_history_days is satisfied.
+#   context - never traded. Fed to the analysis layer as market context only.
+#
+# Nothing here hardcodes exchange minimums. Those are loaded at runtime from
+# the WEEX contract-info endpoint (see src/tradingbot/exchanges/weex.py).
+
+quote: USDT
+
+symbols:
+  - symbol: BTCUSDT
+    tier: core
+    notes: "Regime anchor. Deepest book in crypto; drives beta for everything else."
+
+  - symbol: SOLUSDT
+    tier: core
+    notes: "High beta with real liquidity and clean trending behaviour."
+
+  - symbol: NILUSDT
+    tier: satellite
+    notes: "User pick. Lowest-cap name that still clears a usable volume floor."
+
+  - symbol: GOATUSDT
+    tier: satellite
+    notes: "User pick. Thin book - expect wide spread and wick risk."
+
+  - symbol: DOGEUSDT
+    tier: satellite
+    notes: "High-beta sentiment-driven name with a deep book and years of history."
+
+  - symbol: AXISUSDT
+    tier: paper
+    min_history_days: 90
+    notes: >
+      Listed ~2026-10-21, so there is not enough history to backtest. Ticker is
+      ambiguous across at least three projects, so resolve news/sentiment by
+      contract address, never by ticker. Promote to satellite only after
+      min_history_days of stored candles exist.
+
+# Context-only feeds. Never traded, never sized.
+context:
+  - symbol: ETHUSDT
+    notes: "ETH/BTC ratio input; alt-risk appetite."
+  - symbol: BTC.D
+    source: derived
+    notes: "BTC dominance. Gates whether satellite longs are sensible at all."
+
+# Timeframes pulled for every symbol. The primary decision timeframe is listed first.
+timeframes:
+  primary: 4h
+  additional:
+    - 1d
+    - 1h
+    - 15m

@@ -1,0 +1,60 @@
+# Deterministic risk rules. This layer holds VETO power over the reasoning layer:
+# if a proposed signal violates any rule here, it is rejected and journaled as
+# rejected, with the failing rule recorded. No LLM output can override these.
+
+account:
+  # Used for position sizing until a live balance is wired in.
+  assumed_equity_usdt: 200.0
+  quote_asset: USDT
+
+per_trade:
+  risk_pct: 0.5              # % of equity risked per trade (distance to stop)
+  min_risk_reward: 2.0       # reject anything below 1:2
+  satellite_size_multiplier: 0.5   # satellite tier trades at half size
+  stop:
+    method: atr
+    atr_period: 14
+    atr_multiple: 2.0        # stop distance = 2 x ATR(14) on the primary timeframe
+    satellite_atr_multiple: 3.0   # wider stop on thin books to survive wick hunts
+
+leverage:
+  # Hard ceiling enforced in code, regardless of what the exchange permits.
+  max_effective: 10
+  satellite_max_effective: 5
+
+portfolio:
+  max_open_positions: 2
+  max_same_direction: 2      # no more than 2 positions pointing the same way
+  max_per_base_asset: 1
+  max_satellite_positions: 1
+  # Crypto majors correlate 0.8+ in trends and ~0.95 in a crash. Positions are
+  # weighted by beta-to-BTC so the book cannot become one disguised BTC bet.
+  max_portfolio_btc_beta: 2.0
+  beta_to_btc:
+    BTCUSDT: 1.0
+    ETHUSDT: 1.1
+    SOLUSDT: 1.5
+    DOGEUSDT: 1.8
+    NILUSDT: 2.0
+    GOATUSDT: 2.5
+    AXISUSDT: 2.5
+    default: 2.0
+
+costs:
+  # Friction is checked BEFORE a signal is approved. A 1:2 setup that loses a
+  # third of its edge to spread and funding is not a 1:2 setup.
+  max_spread_pct: 0.10           # reject if spread exceeds this % of price
+  max_abs_funding_rate_8h: 0.05  # reject if |funding| per 8h exceeds this %
+  assumed_taker_fee_pct: 0.06
+  # Expected hold in funding intervals, used to price carry into the R:R check.
+  assumed_hold_funding_intervals: 6
+
+circuit_breakers:
+  max_daily_loss_pct: 3.0
+  max_consecutive_losses: 4
+  halt_on_breach_hours: 24
+
+gates:
+  # Satellite/paper promotion requirements, checked against stored data.
+  min_history_days: 90
+  min_24h_quote_volume: 30000000   # on the venue actually traded, not aggregate

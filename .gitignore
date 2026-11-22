@@ -1,0 +1,23 @@
+# Secrets
+.env
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Data & runtime artifacts
+data/candles/*
+data/cache/*
+!data/candles/.gitkeep
+!data/cache/.gitkeep
+*.sqlite
+*.sqlite-journal
+*.db
+logs/
