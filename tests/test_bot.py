@@ -142,15 +142,24 @@ class TestDispatch:
         assert reply is not None
         assert "not in the universe" in reply
 
-    def test_a_handler_failure_is_reported_rather_than_swallowed(self) -> None:
+    def test_a_handler_failure_is_reported_rather_than_swallowed(self, monkeypatch) -> None:
         """A silent bot is indistinguishable from a dead one.
 
-        No DATABASE_URL is configured in the test environment, so /status
-        raises inside its handler. The bot must say so.
+        The failure is injected rather than relying on an absent database: an
+        earlier version of this test asserted that /status fails, which passed
+        only because the test machine had no DATABASE_URL and broke the moment
+        one was configured.
         """
-        reply = TelegramBot(configured()).handle(update("/status"))
+        bot = TelegramBot(configured())
+
+        def boom(_command):
+            raise RuntimeError("database unreachable")
+
+        monkeypatch.setattr(bot, "_status", boom)
+        reply = bot.handle(update("/status"))
         assert reply is not None
         assert "failed" in reply.lower()
+        assert "RuntimeError" in reply
 
     def test_the_help_text_states_there_is_no_execution(self) -> None:
         reply = TelegramBot(configured()).handle(update("/help"))

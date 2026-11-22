@@ -177,6 +177,9 @@ class RiskGate:
                 "per_trade", "satellite_size_multiplier", default="0.5"
             ),
             regime_multiplier=regime_multiplier,
+            fallback_min_notional=self.config.decimal(
+                "venue", "fallback_min_notional_usdt", default="5.0"
+            ),
         )
         if not size.viable:
             vetoes.append(RiskVeto("sizing.unviable", size.reason))

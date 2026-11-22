@@ -253,6 +253,41 @@ class TestRunRepo:
         repo.finish(run, ok=False, error="boom")
         assert not repo.already_ran("4h", bar, "cron")
 
+    def test_a_failed_run_can_actually_be_restarted(self, session) -> None:
+        """REGRESSION: the unique constraint made retries impossible.
+
+        `already_ran()` correctly permits reprocessing a failed bar, but
+        `start()` then inserted a second row and died on
+        uq_run_per_bar_trigger. One transient failure therefore poisoned that
+        bar forever, because every retry crashed identically.
+        """
+        repo = RunRepo(session)
+        bar = dt.datetime(2026, 11, 22, 16, tzinfo=dt.UTC)
+
+        first = repo.start(trigger="cron", bar_time=bar)
+        repo.finish(first, ok=False, error="transient network failure")
+        assert not repo.already_ran("4h", bar, "cron")
+
+        # Must not raise, and must reuse the same row.
+        second = repo.start(trigger="cron", bar_time=bar)
+        assert second.id == first.id
+        assert second.error is None, "stale error carried into the new attempt"
+        assert second.finished_at is None
+        assert second.ok is False
+
+        repo.finish(second, ok=True, symbols_scanned=6)
+        assert repo.already_ran("4h", bar, "cron")
+
+    def test_restarting_clears_the_previous_counts(self, session) -> None:
+        repo = RunRepo(session)
+        bar = dt.datetime(2026, 11, 22, 20, tzinfo=dt.UTC)
+        first = repo.start(trigger="manual", bar_time=bar)
+        repo.finish(first, ok=True, symbols_scanned=6, signals_approved=4)
+
+        second = repo.start(trigger="manual", bar_time=bar)
+        assert second.symbols_scanned == 0
+        assert second.signals_approved == 0
+
     def test_a_long_traceback_is_truncated(self, session) -> None:
         repo = RunRepo(session)
         run = repo.start(trigger="cron", bar_time=None)

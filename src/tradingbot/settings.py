@@ -72,6 +72,17 @@ class Settings(BaseSettings):
     # No venue credentials. WEEX market data (quotes, funding, contract specs)
     # is public, and nothing here places orders.
 
+    # -- market data source -----------------------------------------------
+    # Binance's main API hosts are DNS-blocked by some ISPs and geo-blocked
+    # (HTTP 451) from some cloud IP ranges, which includes CI runners in
+    # certain regions. `data-api.binance.vision` is Binance's public
+    # market-data mirror and is usually reachable where the others are not.
+    # It serves SPOT candles only, hence the futures flag below.
+    binance_base_url: str | None = None
+    # Futures candles match a perpetual contract more closely, but the mirror
+    # has no futures route. Set false to use spot.
+    binance_use_futures: bool = True
+
     # -- Telegram: both the delivery channel AND the user interface --------
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None

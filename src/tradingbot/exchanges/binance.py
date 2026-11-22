@@ -23,6 +23,9 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.binance.com"
 FUTURES_BASE_URL = "https://fapi.binance.com"
+# Binance's public market-data mirror. Spot routes only, but reachable from
+# networks and cloud regions where the main hosts are DNS- or geo-blocked.
+DATA_MIRROR_URL = "https://data-api.binance.vision"
 
 MAX_LIMIT = 1000
 
@@ -42,10 +45,33 @@ class BinanceHistory:
 
     futures: bool = True
     timeout: float = 20.0
+    # Explicit host override. Needed because Binance's main API is DNS-blocked
+    # by some ISPs and returns HTTP 451 from some cloud IP ranges; the public
+    # data mirror is reachable where those are not.
+    base_url_override: str | None = None
     _client: httpx.Client | None = None
+
+    @classmethod
+    def from_settings(cls, settings=None, *, timeout: float = 20.0) -> BinanceHistory:
+        """Build from configuration.
+
+        Keeps the host and spot/futures choice in one place, so a blocked
+        network is a config change rather than a code change.
+        """
+        if settings is None:
+            from ..settings import get_settings
+
+            settings = get_settings()
+        return cls(
+            futures=settings.binance_use_futures,
+            base_url_override=settings.binance_base_url,
+            timeout=timeout,
+        )
 
     @property
     def base_url(self) -> str:
+        if self.base_url_override:
+            return self.base_url_override.rstrip("/")
         return FUTURES_BASE_URL if self.futures else BASE_URL
 
     @property

@@ -42,6 +42,7 @@ def size_position(
     satellite_multiplier: Decimal = Decimal("0.5"),
     regime_multiplier: Decimal = Decimal("1.0"),
     max_margin_fraction: Decimal = Decimal("0.5"),
+    fallback_min_notional: Decimal | None = None,
 ) -> PositionSize:
     """Size a position from the risk budget, then check it against reality."""
     if equity <= 0:
@@ -109,6 +110,20 @@ def size_position(
                 f"This trade needs about {needed_equity:.0f} USDT of equity at "
                 f"{risk_pct}% risk.",
             )
+
+    # --- floor when the venue spec is unavailable ------------------------
+    # A missing spec is normal: WEEX may be unreachable or its cache empty. But
+    # with no spec there is no minimum to check, and sizing would otherwise
+    # report a $0.80 position as viable. Observed on a real DOGEUSDT signal.
+    if spec is None and fallback_min_notional is not None and notional < fallback_min_notional:
+        return PositionSize.unviable(
+            setup.symbol,
+            f"position value {notional:.4f} USDT is below the assumed venue "
+            f"minimum {fallback_min_notional} (no live contract spec available, "
+            f"so this is a configured floor, not an exchange-reported one). "
+            f"Risk budget {risk_amount:.4f} USDT over a {risk_per_unit} stop "
+            "cannot buy a tradeable position.",
+        )
 
     # --- margin sanity ---------------------------------------------------
     # A single trade must not consume the account even when its risk is small:

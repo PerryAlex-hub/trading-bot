@@ -66,17 +66,26 @@ def _build_engine(url: str, *, pooled: bool, settings: Settings) -> Engine:
     pool open against a compute that is about to suspend buys nothing and
     keeps the Neon instance awake, burning the free CU-hour budget.
     """
+    connect_args: dict[str, object] = {
+        "application_name": "tradingbot",
+        "connect_timeout": 15,
+    }
+    if not pooled:
+        # Server-side statement cap, so a runaway query against the candle
+        # table fails fast instead of eating the monthly compute allowance.
+        #
+        # Only on the DIRECT endpoint. Neon's pooler is PgBouncer in
+        # transaction mode and rejects `options` outright with "unsupported
+        # startup parameter in options: statement_timeout", which fails every
+        # connection rather than degrading. The pooled path gets the same
+        # protection from `SET LOCAL` in `session_scope()`, which is
+        # transaction-scoped and therefore safe under transaction pooling.
+        connect_args["options"] = f"-c statement_timeout={settings.db_statement_timeout_ms}"
+
     kwargs: dict[str, object] = {
         "pool_pre_ping": True,  # non-negotiable against a suspending compute
         "future": True,
-        "connect_args": {
-            # Server-side cap. A runaway analytical query against the candle
-            # table should fail fast rather than consume the monthly compute
-            # allowance in one go.
-            "options": f"-c statement_timeout={settings.db_statement_timeout_ms}",
-            "application_name": "tradingbot",
-            "connect_timeout": 15,
-        },
+        "connect_args": connect_args,
     }
     if pooled:
         kwargs.update(
@@ -168,6 +177,7 @@ def session_scope() -> Iterator[Session]:
     """
     session = _session_factory()()
     try:
+        _apply_statement_timeout(session)
         yield session
         session.commit()
     except Exception:
@@ -175,6 +185,25 @@ def session_scope() -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+def _apply_statement_timeout(session: Session) -> None:
+    """Cap query time for this transaction only.
+
+    `SET LOCAL` rather than `SET`, and rather than a startup parameter. Neon's
+    pooler refuses `options` at connect time, and a plain `SET` under
+    transaction pooling would leak the setting to whichever client got the
+    connection next. `SET LOCAL` is scoped to the transaction and reverts on
+    commit, which is the only variant that is both effective and safe here.
+
+    Failure is not fatal: losing a timeout cap is worse than nothing but much
+    better than losing the run.
+    """
+    timeout_ms = get_settings().db_statement_timeout_ms
+    try:
+        session.execute(text(f"SET LOCAL statement_timeout = {int(timeout_ms)}"))
+    except Exception as exc:  # pragma: no cover - dialect dependent
+        log.debug("Could not set statement_timeout: %s", exc)
 
 
 def dispose_engine() -> None:

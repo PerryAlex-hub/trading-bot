@@ -58,3 +58,11 @@ gates:
   # Satellite/paper promotion requirements, checked against stored data.
   min_history_days: 90
   min_24h_quote_volume: 30000000   # on the venue actually traded, not aggregate
+
+venue:
+  # Assumed minimum order value when the live contract spec is unavailable
+  # (WEEX unreachable, or its cache not yet populated). Without this, sizing
+  # has no floor to check and will happily "approve" a position worth less than
+  # a dollar, which no exchange would accept. Err high: an over-strict floor
+  # skips a trade, an absent one produces a signal that cannot be taken.
+  fallback_min_notional_usdt: 5.0

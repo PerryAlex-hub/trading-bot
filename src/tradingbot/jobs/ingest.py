@@ -79,15 +79,18 @@ def ingest_candles(
     universe: Universe | None = None,
     timeframes: tuple[str, ...] | None = None,
     prune: bool = True,
-    futures: bool = True,
 ) -> IngestResult:
-    """Bring every symbol's candle history up to date."""
+    """Bring every symbol's candle history up to date.
+
+    The data host and spot/futures choice come from settings, because
+    Binance's main API is unreachable from some networks and cloud regions.
+    """
     universe = universe or load_universe()
     wanted = timeframes or universe.all_timeframes
     result = IngestResult()
     symbols = universe.symbols_requiring_data()
 
-    with BinanceHistory(futures=futures) as api:
+    with BinanceHistory.from_settings() as api:
         for symbol in symbols:
             result.symbols += 1
             for timeframe in wanted:

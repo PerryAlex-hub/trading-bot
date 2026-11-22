@@ -71,6 +71,7 @@ def build_setup(
     min_risk_reward: Decimal = Decimal("2.0"),
     structure_buffer_atr: Decimal = Decimal("0.25"),
     entry_pullback_atr: Decimal = Decimal("0.15"),
+    max_structure_atr: Decimal = Decimal("1.5"),
 ) -> SetupProposal:
     """Construct entry, stop and targets from an analysed snapshot."""
     side = snapshot.side
@@ -94,7 +95,8 @@ def build_setup(
 
     entry, entry_basis = _choose_entry(snapshot, price, atr_value, side, entry_pullback_atr)
     stop, stop_basis = _choose_stop(
-        snapshot, entry, atr_value, side, multiple, structure_buffer_atr
+        snapshot, entry, atr_value, side, multiple, structure_buffer_atr,
+        max_structure_atr=max_structure_atr,
     )
 
     # Guard the invariant TradeSetup enforces, but with a readable message:
@@ -191,12 +193,27 @@ def _choose_stop(
     side: Side,
     multiple: Decimal,
     buffer_atr: Decimal,
+    max_structure_atr: Decimal = Decimal("1.5"),
 ) -> tuple[Decimal, str]:
     """Place the stop beyond both the ATR distance and recent structure.
 
-    Takes the WIDER of the two. A stop that is merely ATR-based can sit just
-    inside an obvious swing low, which is the single most reliably hunted price
-    on any chart. The buffer past structure is what keeps it out of the wick.
+    Takes the WIDER of the two, up to a cap. A stop that is merely ATR-based
+    can sit just inside an obvious swing low, which is the most reliably hunted
+    price on any chart, so the buffer past structure is what keeps it out of
+    the wick zone.
+
+    **But the widening is capped at `max_structure_atr` times the ATR stop**,
+    and that cap is load-bearing. On a real DOGEUSDT signal the nearest
+    resistance sat 30% above price, and "wider wins" turned a 7.7% ATR stop
+    into a 31% one - a 12x ATR stop. The knock-on effects made the signal
+    worthless rather than merely wide: sizing shrank the position to $0.80 of
+    notional to keep risk at $0.25, no structural target existed that far out
+    so the target fell back to a 2.5R projection implying a 78% fall, and the
+    reported 2.5 risk:reward was arithmetically true and economically fiction.
+
+    When structure is further away than the cap, the ATR stop is used on its
+    own. That is a legitimate volatility stop, and it is recorded as such so
+    the journal shows structure was out of reach.
     """
     atr_stop = (
         entry - atr_value * multiple if side is Side.LONG
@@ -205,6 +222,9 @@ def _choose_stop(
     basis = f"{multiple} x ATR from entry"
 
     buffer = atr_value * buffer_atr
+    # How far the stop may be widened to reach structure, as an absolute price
+    # distance from entry.
+    max_distance = atr_value * multiple * max_structure_atr
     structural: Decimal | None = None
 
     if side is Side.LONG:
@@ -220,6 +240,12 @@ def _choose_stop(
                 below = candidate - buffer
                 structural = below if structural is None else min(structural, below)
         if structural is not None and structural < atr_stop:
+            if entry - structural > max_distance:
+                return atr_stop, (
+                    f"{multiple}x ATR from entry; structure at {structural} was "
+                    f"{(entry - structural) / atr_value:.1f}x ATR away, beyond the "
+                    f"{max_structure_atr}x widening cap, so it was ignored"
+                )
             return structural, (
                 f"{buffer_atr} ATR below structure (wider than {multiple}x ATR, "
                 "so the stop sits outside the wick zone)"
@@ -238,6 +264,12 @@ def _choose_stop(
             above = candidate + buffer
             structural = above if structural is None else max(structural, above)
     if structural is not None and structural > atr_stop:
+        if structural - entry > max_distance:
+            return atr_stop, (
+                f"{multiple}x ATR from entry; structure at {structural} was "
+                f"{(structural - entry) / atr_value:.1f}x ATR away, beyond the "
+                f"{max_structure_atr}x widening cap, so it was ignored"
+            )
         return structural, (
             f"{buffer_atr} ATR above structure (wider than {multiple}x ATR, "
             "so the stop sits outside the wick zone)"

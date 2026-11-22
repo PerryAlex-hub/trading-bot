@@ -243,6 +243,45 @@ class RunRepo:
         git_sha: str | None = None,
         config_fingerprint: str | None = None,
     ) -> AnalysisRun:
+        """Begin (or restart) the run row for this bar and trigger.
+
+        Reuses an existing row rather than inserting a second one. The unique
+        constraint on (timeframe, bar_time, trigger) is there to keep one
+        record per bar, but inserting blindly made two legitimate operations
+        impossible: retrying a FAILED run, and `analyse --force`. In both cases
+        `already_ran()` correctly says the bar may be processed, and then the
+        insert died on the constraint - so a single transient failure
+        permanently poisoned that bar, because every retry crashed the same way.
+
+        Observed in practice on the second manual run of one bar.
+        """
+        existing = (
+            self.session.execute(
+                select(AnalysisRun).where(
+                    AnalysisRun.timeframe == timeframe,
+                    AnalysisRun.bar_time == bar_time,
+                    AnalysisRun.trigger == trigger,
+                )
+            ).scalar_one_or_none()
+            if bar_time is not None
+            else None
+        )
+
+        if existing is not None:
+            # Reset it to "in progress" so a stale error or count from the
+            # previous attempt cannot be mistaken for this one's result.
+            existing.started_at = utcnow()
+            existing.finished_at = None
+            existing.ok = False
+            existing.error = None
+            existing.symbols_scanned = 0
+            existing.candidates_found = 0
+            existing.signals_approved = 0
+            existing.git_sha = git_sha
+            existing.config_fingerprint = config_fingerprint
+            self.session.flush()
+            return existing
+
         run = AnalysisRun(
             trigger=trigger,
             bar_time=bar_time,
