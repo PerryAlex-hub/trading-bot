@@ -477,7 +477,31 @@ class TelegramBot:
             eth = repo.latest("ETHUSDT", universe.primary_timeframe, limit=400)
 
         if not frames.get(universe.primary_timeframe):
-            return f"No stored candles for `{symbol}`. Has ingest run?"
+            # Name the symbols that DO work. "Has ingest run?" was a dead end:
+            # it implied a setup mistake when the real cause is that this
+            # symbol is not carried by the price feed at all, and it left no
+            # way to discover which symbols are usable.
+            from ..analysis.pipeline import MIN_BARS_FOR_ANALYSIS
+
+            with session_scope() as session:
+                repo = CandleRepo(session)
+                usable = [
+                    other.symbol
+                    for other in universe.symbols
+                    if repo.count(other.symbol, universe.primary_timeframe)
+                    >= MIN_BARS_FOR_ANALYSIS
+                ]
+            if usable:
+                return (
+                    f"No price data for `{symbol}` - it is configured in the "
+                    "universe but is not carried by the Binance feed, so it "
+                    "cannot be analysed.\n\n"
+                    "*Try:* " + ", ".join(f"`/analyse {s}`" for s in usable)
+                )
+            return (
+                f"No stored candles for `{symbol}`, and no other symbol has "
+                "data either. The ingest job has not run yet - check /runs."
+            )
 
         try:
             snapshot = analyse_symbol(
@@ -536,23 +560,53 @@ class TelegramBot:
         return "\n".join(lines)
 
     def _universe(self, _: BotCommand) -> str:
+        """What is watched, and crucially what can actually be analysed.
+
+        Reports stored bar counts per symbol, not just the configured list.
+        Being in `universe.yaml` and having usable data are different things -
+        GOATUSDT and AXISUSDT are configured but are not listed on the Binance
+        spot feed, so they have no candles at all. Showing only the config made
+        `/analyse GOATUSDT` fail with no hint that another symbol would work.
+        """
+        from ..analysis.pipeline import MIN_BARS_FOR_ANALYSIS
         from ..config import load_risk, load_universe
+        from ..db.engine import session_scope
+        from ..db.repo import CandleRepo
 
         universe = load_universe()
         risk = load_risk()
         cap = risk.decimal("portfolio", "max_portfolio_btc_beta", default="2.0")
+        timeframe = universe.primary_timeframe
 
+        with session_scope() as session:
+            repo = CandleRepo(session)
+            bars = {
+                config.symbol: repo.count(config.symbol, timeframe)
+                for config in universe.symbols
+            }
+
+        ready = [s for s, n in bars.items() if n >= MIN_BARS_FOR_ANALYSIS]
         lines = [
             "*Universe*",
-            f"primary timeframe `{universe.primary_timeframe}`",
+            f"timeframe `{timeframe}` | {len(ready)} of {len(bars)} symbols have data",
             "",
         ]
         for config in universe.symbols:
+            count = bars[config.symbol]
             beta = risk.beta_to_btc(config.symbol)
-            blocked = " *[blocked: beta > cap]*" if beta > cap else ""
-            lines.append(
-                f"`{config.symbol}` {config.tier.value} beta `{beta}`{blocked}"
-            )
+            if count == 0:
+                note = " - *no data* (not on the price feed)"
+            elif count < MIN_BARS_FOR_ANALYSIS:
+                note = f" - only {count} bars, needs {MIN_BARS_FOR_ANALYSIS}"
+            elif beta > cap:
+                note = f" - *{count} bars, but blocked:* beta {beta} > cap {cap}"
+            else:
+                note = f" - {count} bars, tradeable"
+            lines.append(f"`{config.symbol}` ({config.tier.value}){note}")
+
+        if ready:
+            lines += ["", "*You can analyse:* " + ", ".join(f"`{s}`" for s in ready)]
+
         lines += [
             "",
             "*Risk*",
