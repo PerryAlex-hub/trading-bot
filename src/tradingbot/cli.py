@@ -132,7 +132,7 @@ def analyse(
 
 @app.command()
 def monitor(no_notify: bool = typer.Option(False, "--no-notify")) -> None:
-    """Reconcile positions against the venue and check circuit breakers."""
+    """Resolve open paper positions against recent candles."""
     from .jobs.monitor import run_monitor, snapshot_account
 
     snapshot_account()
