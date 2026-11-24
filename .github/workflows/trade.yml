@@ -89,12 +89,19 @@ jobs:
       TRADING_MODE: ${{ vars.TRADING_MODE || 'paper' }}
       LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
       # Binance's main API returns HTTP 451 from many cloud IP ranges, and
-      # GitHub's runners are Azure-hosted, so ingest can fail here even though
-      # it works locally. Leave these unset to use the default hosts; set
-      # BINANCE_BASE_URL to https://data-api.binance.vision (with
-      # BINANCE_USE_FUTURES=false, since the mirror is spot-only) if the
-      # "Check the market data host is reachable" step below fails.
-      # An unset variable arrives as an empty string, which the settings layer
+      # GitHub's runners are Azure-hosted, so ingest fails here even though it
+      # works locally. This no longer needs operator action: the client now
+      # detects a 451/403 and falls back to https://data-api.binance.vision
+      # (spot routes) on its own, once per process.
+      #
+      # That change was made because this comment used to be the fix, and it
+      # was not enough. Every ingest on the first deployment returned 451;
+      # symbols with stored candles were still analysed from the database so
+      # the run looked healthy, while the two newly added symbols had nothing
+      # stored and were skipped in silence.
+      #
+      # These variables remain as an override, to pin a host deliberately. An
+      # unset variable arrives as an empty string, which the settings layer
       # treats as "use the default".
       BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL }}
       BINANCE_USE_FUTURES: ${{ vars.BINANCE_USE_FUTURES || 'true' }}

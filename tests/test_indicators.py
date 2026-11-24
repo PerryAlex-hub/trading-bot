@@ -9,9 +9,11 @@ forever.
 
 from __future__ import annotations
 
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
+import respx
 
 from tradingbot.analysis import indicators as ind
 
@@ -166,3 +168,70 @@ class TestDegenerateInput:
     def test_short_series_returns_all_nan_rather_than_raising(self) -> None:
         frame = make_frame(n=5, seed=1)
         assert ind.atr(frame, 14).isna().all()
+
+
+class TestBinanceGeoBlockFallback:
+    """A 451 must not end the ingest.
+
+    The first live deployment returned 451 for every symbol and timeframe from
+    the GitHub runner. Symbols with stored candles were still analysed from the
+    database, so the run reported success - but the two newly added symbols had
+    nothing stored and were skipped in silence. The operator's visible symptom
+    was "I cannot see the new tickers", which is several steps from the cause.
+    """
+
+    def _klines(self, count: int = 3) -> list[list]:
+        base = 1_700_000_000_000
+        return [
+            [base + i * 14_400_000, "1", "2", "0.5", "1.5", "10",
+             base + (i + 1) * 14_400_000 - 1, "15", 5, "5", "7", "0"]
+            for i in range(count)
+        ]
+
+    @respx.mock
+    def test_falls_back_to_the_mirror_and_returns_candles(self) -> None:
+        from tradingbot.exchanges.binance import DATA_MIRROR_URL, BinanceHistory
+
+        blocked = respx.get(url__startswith="https://fapi.binance.com/fapi/v1/klines").mock(
+            return_value=httpx.Response(451, text="unavailable for legal reasons")
+        )
+        mirrored = respx.get(url__startswith=f"{DATA_MIRROR_URL}/api/v3/klines").mock(
+            return_value=httpx.Response(200, json=self._klines())
+        )
+
+        with BinanceHistory(futures=True) as api:
+            candles = api.candles("PEPEUSDT", "4h", max_candles=3)
+
+        assert blocked.called
+        assert mirrored.called
+        assert len(candles) >= 1
+
+    @respx.mock
+    def test_the_fallback_is_attempted_once_not_per_page(self) -> None:
+        """Otherwise every page would re-probe the blocked host."""
+        from tradingbot.exchanges.binance import DATA_MIRROR_URL, BinanceHistory
+
+        blocked = respx.get(url__startswith="https://fapi.binance.com").mock(
+            return_value=httpx.Response(451)
+        )
+        respx.get(url__startswith=DATA_MIRROR_URL).mock(
+            return_value=httpx.Response(200, json=self._klines())
+        )
+
+        with BinanceHistory(futures=True) as api:
+            api.candles("XRPUSDT", "4h", max_candles=3)
+            api.candles("DOGEUSDT", "4h", max_candles=3)
+
+        assert blocked.call_count == 1
+
+    @respx.mock
+    def test_a_non_geo_error_still_raises(self) -> None:
+        """A 400 is a bad request, not a reason to change venue."""
+        from tradingbot.exchanges.binance import BinanceHistory
+
+        respx.get(url__startswith="https://fapi.binance.com").mock(
+            return_value=httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+        )
+
+        with BinanceHistory(futures=True) as api, pytest.raises(httpx.HTTPStatusError):
+            api.candles("NOTACOINUSDT", "4h", max_candles=3)

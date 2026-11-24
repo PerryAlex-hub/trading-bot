@@ -50,6 +50,13 @@ class BinanceHistory:
     # data mirror is reachable where those are not.
     base_url_override: str | None = None
     _client: httpx.Client | None = None
+    # Set once a geo-block has pushed this client onto the mirror, so the
+    # fallback is attempted at most once instead of on every page.
+    _on_mirror: bool = False
+
+    def __post_init__(self) -> None:
+        if self.base_url_override and DATA_MIRROR_URL in self.base_url_override:
+            self._on_mirror = True
 
     @classmethod
     def from_settings(cls, settings=None, *, timeout: float = 20.0) -> BinanceHistory:
@@ -98,6 +105,40 @@ class BinanceHistory:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    # Status codes Binance uses to refuse a caller by location rather than by
+    # request. 451 is the documented one; 403 appears from some ranges too.
+    _GEO_BLOCKED = frozenset({403, 451})
+
+    def _fall_back_to_mirror(self) -> bool:
+        """Switch to the public data mirror after a geo-block. Returns success.
+
+        Worth doing automatically rather than leaving to configuration. The
+        workflow already carried a comment telling the operator to set
+        BINANCE_BASE_URL by hand when this happened, and the first deployment
+        shows why that is not enough: every ingest returned 451, the newly
+        added symbols had no stored candles to fall back on, and so they were
+        skipped silently while the run reported success. A failure mode whose
+        fix is "read a comment and set two repository variables" is a failure
+        mode that stays broken.
+
+        The mirror serves SPOT routes only, so this also turns futures off.
+        That is a real difference - spot candles carry no perpetual basis - but
+        on a 4h decision timeframe it is far smaller than the difference
+        between having candles and having none.
+        """
+        if self._on_mirror:
+            return False
+        log.warning(
+            "Binance returned a geo-block; falling back to the public data "
+            "mirror at %s (spot routes)",
+            DATA_MIRROR_URL,
+        )
+        self.base_url_override = DATA_MIRROR_URL
+        self.futures = False
+        self._on_mirror = True
+        self.close()  # force a new client bound to the new base URL
+        return True
+
     def _page(
         self, symbol: str, interval: str, start_ms: int | None, limit: int
     ) -> list[list[Any]]:
@@ -108,8 +149,17 @@ class BinanceHistory:
         }
         if start_ms is not None:
             params["startTime"] = start_ms
-        response = self._http().get(self._path, params=params)
-        response.raise_for_status()
+
+        try:
+            response = self._http().get(self._path, params=params)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in self._GEO_BLOCKED and self._fall_back_to_mirror():
+                response = self._http().get(self._path, params=params)
+                response.raise_for_status()
+            else:
+                raise
+
         payload = response.json()
         return payload if isinstance(payload, list) else []
 
