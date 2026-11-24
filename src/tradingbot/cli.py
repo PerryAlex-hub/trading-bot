@@ -360,6 +360,120 @@ def minimums(
         )
 
 
+@app.command()
+def backtest(
+    days: int = typer.Option(540, "--days", help="How much stored history to replay"),
+    symbol: list[str] = typer.Option(None, "--symbol", "-s", help="Limit to these symbols"),
+    max_wait: int = typer.Option(3, "--max-wait", help="Bars a limit entry may rest"),
+    max_hold: int = typer.Option(30, "--max-hold", help="Bars before a trade is timed out"),
+    show_trades: int = typer.Option(10, "--show-trades", help="How many trades to list"),
+) -> None:
+    """Replay stored candles through the real decision path.
+
+    Calls the same analyse / build_setup / RiskGate functions the scheduler
+    calls, on frames truncated at each decision bar, so what is measured is the
+    live system rather than a second implementation of it.
+    """
+    from typing import Any
+
+    from .analysis.frame import to_frame
+    from .backtest import run_backtest, summarise
+    from .config import load_risk, load_universe
+    from .db.engine import session_scope
+    from .db.repo import CandleRepo
+    from .models import Timeframe
+
+    universe = load_universe()
+    risk = load_risk()
+    wanted = {s.upper() for s in symbol} if symbol else None
+
+    cutoff = datetime.now(tz=UTC) - timedelta(days=days)
+    needed = [
+        s for s in universe.symbols_requiring_data()
+        if wanted is None or s in wanted
+    ]
+
+    console.print(f"[bold]Loading[/bold] {len(needed)} symbols, {days} days")
+    candles: dict[str, dict[str, Any]] = {}
+    with session_scope() as session:
+        repo = CandleRepo(session)
+        for name in needed:
+            frames = {}
+            for timeframe in universe.all_timeframes:
+                rows = repo.range(name, timeframe, start=cutoff)
+                if rows:
+                    frames[timeframe] = to_frame(rows)
+            if frames:
+                candles[name] = frames
+                primary = frames.get(universe.primary_timeframe)
+                console.print(
+                    f"  {name:<10} {len(primary) if primary is not None else 0} "
+                    f"{universe.primary_timeframe} bars"
+                )
+
+    if not candles:
+        console.print("[red]No stored candles.[/red] Run `tradingbot ingest` first.")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold]Replaying[/bold] (recomputing indicators per bar; this is slow)")
+    result = run_backtest(
+        candles_by_symbol=candles,
+        universe=universe,
+        risk_config=risk,
+        primary=Timeframe(universe.primary_timeframe),
+        max_wait_bars=max_wait,
+        max_hold_bars=max_hold,
+    )
+    stats = summarise(result)
+
+    for error in result.errors[:5]:
+        console.print(f"  [red]{error}[/red]")
+
+    table = Table(title="Backtest")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in (
+        "bars_examined", "signals_approved", "signals_rejected", "never_filled",
+        "trades", "wins", "losses", "win_rate", "total_r", "expectancy_r",
+        "profit_factor", "max_drawdown_r", "longest_losing_streak",
+    ):
+        if key in stats:
+            table.add_row(key.replace("_", " "), str(stats[key]))
+    console.print(table)
+
+    if stats.get("outcomes"):
+        console.print(f"[dim]outcomes: {stats['outcomes']}[/dim]")
+    if stats.get("top_vetoes"):
+        console.print("\n[bold]Most common vetoes[/bold]")
+        for rule, count in stats["top_vetoes"]:  # type: ignore[union-attr]
+            console.print(f"  {count:>5}  {rule}")
+
+    if show_trades and result.filled:
+        console.print(f"\n[bold]Last {show_trades} resolved trades[/bold]")
+        for trade in result.filled[-show_trades:]:
+            r = trade.r_multiple
+            console.print(
+                f"  {trade.decision_bar:%Y-%m-%d %H:%M}  {trade.symbol:<9} "
+                f"{trade.side.value:<5} {trade.outcome.value:<10} "
+                f"{f'{float(r):+.2f}R' if r is not None else 'n/a':>8}"
+            )
+
+    expectancy = stats.get("expectancy_r")
+    if isinstance(expectancy, float):
+        if expectancy > 0:
+            console.print(
+                f"\n[green]Positive expectancy: {expectancy:+.4f}R per trade[/green] "
+                f"over {stats['trades']} trades. Treat it as a hypothesis until "
+                "forward testing agrees."
+            )
+        else:
+            console.print(
+                f"\n[yellow]Negative expectancy: {expectancy:+.4f}R per trade[/yellow] "
+                f"over {stats['trades']} trades. The win rate is not the problem "
+                "to chase; the setup or the stop placement is."
+            )
+
+
 @app.command("clear-breaker")
 def clear_breaker() -> None:
     """Manually clear an active circuit breaker."""
