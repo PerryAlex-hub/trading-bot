@@ -21,16 +21,6 @@ symbols:
     tier: core
     notes: "High beta with real liquidity and clean trending behaviour."
 
-  # MEASURED 2026-11-24: 0.8M USD of 24h volume across 12,012 trades. That is
-  # 37x BELOW this file's own gates.min_24h_quote_volume of 30M, and it passes
-  # only because that gate is not enforced anywhere in the code. On a book this
-  # thin the spread and slippage will consume most of a 1:2 setup's edge.
-  # Kept because it is a deliberate user pick, but it is the weakest symbol
-  # here and the first one to drop if results disappoint.
-  - symbol: NILUSDT
-    tier: satellite
-    notes: "User pick. Thin: 0.8M USD daily volume, well under the intended floor."
-
   # Added for small-account testing. WEEX futures are contract-denominated, so
   # the smallest order is one contract and costs `contract_val x price`. BTC's
   # minimum is ~6 USDT purely because BTC is expensive; a coin priced in

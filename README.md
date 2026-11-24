@@ -364,7 +364,8 @@ decision rather than a bug to be silently "fixed":
 | BTCUSDT | 1.0 | 2.0 | fine |
 | SOLUSDT | 1.5 | 2.0 | fine |
 | DOGEUSDT | 1.8 | 2.0 | fine |
-| NILUSDT | 2.0 | 2.0 | tradeable only alone |
+| XRPUSDT | 1.0 | 2.0 | fine |
+| PEPEUSDT | 2.0 | 2.0 | tradeable only alone |
 | **GOATUSDT** | **2.5** | 2.0 | **never tradeable** |
 | **AXISUSDT** | **2.5** | 2.0 | **never tradeable** |
 
