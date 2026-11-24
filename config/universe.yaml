@@ -21,9 +21,32 @@ symbols:
     tier: core
     notes: "High beta with real liquidity and clean trending behaviour."
 
+  # MEASURED 2026-11-24: 0.8M USD of 24h volume across 12,012 trades. That is
+  # 37x BELOW this file's own gates.min_24h_quote_volume of 30M, and it passes
+  # only because that gate is not enforced anywhere in the code. On a book this
+  # thin the spread and slippage will consume most of a 1:2 setup's edge.
+  # Kept because it is a deliberate user pick, but it is the weakest symbol
+  # here and the first one to drop if results disappoint.
   - symbol: NILUSDT
     tier: satellite
-    notes: "User pick. Lowest-cap name that still clears a usable volume floor."
+    notes: "User pick. Thin: 0.8M USD daily volume, well under the intended floor."
+
+  # Added for small-account testing. WEEX futures are contract-denominated, so
+  # the smallest order is one contract and costs `contract_val x price`. BTC's
+  # minimum is ~6 USDT purely because BTC is expensive; a coin priced in
+  # millionths of a dollar costs a fraction of a cent to open. PEPE is the only
+  # name that is simultaneously that cheap AND genuinely liquid: 47M USD of
+  # 24h volume over 114,230 trades, measured 2026-11-24.
+  - symbol: PEPEUSDT
+    tier: satellite
+    notes: "Cheapest liquid unit price, so the venue minimum is a fraction of a cent."
+
+  # The most liquid name in the sub-dollar tier by a wide margin: 158M USD and
+  # 683,383 trades, more active than SOL. Also the closest thing crypto has to
+  # a decorrelated major, since it moves on its own regulatory calendar.
+  - symbol: XRPUSDT
+    tier: satellite
+    notes: "Deepest sub-dollar book; moves on its own catalysts rather than BTC beta."
 
   # NOT CURRENTLY TRADEABLE BY THIS BOT. Candles come from Binance (see
   # exchanges/binance.py for why), and GOATUSDT is not listed on Binance at
