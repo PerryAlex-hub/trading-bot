@@ -45,8 +45,6 @@ portfolio:
     XRPUSDT: 1.0
     DOGEUSDT: 1.8
     PEPEUSDT: 2.0
-    GOATUSDT: 2.5
-    AXISUSDT: 2.5
     default: 2.0
 
 costs:

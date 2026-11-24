@@ -563,10 +563,13 @@ class TelegramBot:
         """What is watched, and crucially what can actually be analysed.
 
         Reports stored bar counts per symbol, not just the configured list.
-        Being in `universe.yaml` and having usable data are different things -
-        GOATUSDT and AXISUSDT are configured but are not listed on the Binance
-        spot feed, so they have no candles at all. Showing only the config made
-        `/analyse GOATUSDT` fail with no hint that another symbol would work.
+        Being in `universe.yaml` and having usable data are different things:
+        GOATUSDT and AXISUSDT were configured for days while not being listed
+        on the data venue at all, so they held no candles and produced no
+        signals, and showing only the config made `/analyse GOATUSDT` fail with
+        no hint that another symbol would work. Both have since been removed,
+        but the next symbol added from the wrong venue will land in the same
+        state, so the bar counts stay.
         """
         from ..analysis.pipeline import MIN_BARS_FOR_ANALYSIS
         from ..config import load_risk, load_universe

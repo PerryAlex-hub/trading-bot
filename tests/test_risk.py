@@ -373,18 +373,20 @@ class TestRiskGate:
         assert "costs.max_spread_pct" in rules
 
 
-class TestConfigContradiction:
-    def test_beta_cap_makes_some_configured_symbols_unreachable(self, risk_config) -> None:
-        """Documents a real contradiction found in the shipped risk.yaml.
+class TestConfigCoherence:
+    def test_no_configured_symbol_is_unreachable(self, risk_config) -> None:
+        """Every tradeable symbol must fit inside the portfolio beta budget.
 
-        GOATUSDT and AXISUSDT carry beta_to_btc 2.5 while
-        max_portfolio_btc_beta is 2.0, so each exceeds the whole portfolio
-        budget by itself and can never be traded, even on an empty book.
+        This used to assert the opposite: GOATUSDT and AXISUSDT carried
+        beta_to_btc 2.5 against a 2.0 cap, so each exceeded the whole budget by
+        itself and could never be traded even on an empty book. The test pinned
+        that contradiction so a config change would be noticed.
 
-        This test asserts the GATE behaves consistently with the config, not
-        that the config is correct. If the cap is raised or the betas lowered,
-        this test is expected to fail and should be updated - that is the
-        point of pinning it.
+        Both symbols have since been removed - they were not listed on the data
+        venue either, so they ingested nothing and produced nothing - and the
+        assertion is now the one worth holding: a symbol in the universe should
+        be capable of trading. A symbol that cannot is configuration that looks
+        like capability.
         """
         from tradingbot.config import load_universe
 
@@ -394,8 +396,29 @@ class TestConfigContradiction:
             for config in load_universe().symbols
             if config.tier.tradeable and risk_config.beta_to_btc(config.symbol) > cap
         ]
-        assert "GOATUSDT" in unreachable, (
-            "risk.yaml appears to have changed; update this test and the README note"
+        assert not unreachable, (
+            f"these symbols can never trade: {unreachable}. Their beta_to_btc "
+            f"exceeds max_portfolio_btc_beta ({cap}), so the gate vetoes them "
+            "even on an empty book. Lower the beta, raise the cap, or remove them."
+        )
+
+    def test_at_most_one_symbol_sits_exactly_on_the_cap(self, risk_config) -> None:
+        """A symbol at exactly the cap is tradeable only alone.
+
+        Not an error - 2.0 for a memecoin is honest - but worth knowing, since
+        it makes max_open_positions unreachable while that symbol is held.
+        """
+        from tradingbot.config import load_universe
+
+        cap = risk_config.decimal("portfolio", "max_portfolio_btc_beta", default="2.0")
+        at_cap = [
+            config.symbol
+            for config in load_universe().symbols
+            if config.tier.tradeable and risk_config.beta_to_btc(config.symbol) == cap
+        ]
+        assert at_cap == ["PEPEUSDT"], (
+            f"symbols sitting exactly on the beta cap changed: {at_cap}. Each one "
+            "can only be held alone; update this test and the README note."
         )
 
 

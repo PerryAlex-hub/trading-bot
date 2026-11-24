@@ -348,38 +348,42 @@ need the spread and funding of the venue a trade would actually be taken on.
 Binance's spread tells you nothing about WEEX's book, and on a thin satellite
 pair the spread is what destroys the edge.
 
-Note that minimums are an **exchange floor, not a per-coin one**. If WEEX
-enforces a ~$5 minimum order value it applies to GOATUSDT as much as BTCUSDT.
-Low caps do not lower your minimum; leverage lowers your *margin*. $5 notional
-at 10x costs $0.50 of margin. `ContractSpec.min_cost()` computes this per pair
-from live data.
+Note how minimums actually work on WEEX: futures are **contract-denominated**,
+so the smallest order is one contract and costs `contract_val x price`. BTC's
+~6 USDT minimum is a consequence of BTC's price, not a venue-wide dollar floor -
+which is why a coin priced in millionths of a dollar opens for a fraction of a
+cent. Leverage then reduces the *margin* against that notional, not the notional
+itself. `tradingbot minimums` ranks every contract by this, and
+`ContractSpec.min_cost()` computes it per pair from live data.
 
-## Known issue: two symbols can never trade
+## The beta cap, and what it still constrains
 
-`risk.yaml` contains a contradiction, left in place because it is a risk
-decision rather than a bug to be silently "fixed":
+`risk.yaml` caps total beta-weighted exposure in one direction at 2.0, which is
+the rule that stops the book becoming three correlated BTC bets in different
+tickers.
 
 | Symbol | `beta_to_btc` | `max_portfolio_btc_beta` | Result |
 |---|---|---|---|
 | BTCUSDT | 1.0 | 2.0 | fine |
+| XRPUSDT | 1.0 | 2.0 | fine |
 | SOLUSDT | 1.5 | 2.0 | fine |
 | DOGEUSDT | 1.8 | 2.0 | fine |
-| XRPUSDT | 1.0 | 2.0 | fine |
 | PEPEUSDT | 2.0 | 2.0 | tradeable only alone |
-| **GOATUSDT** | **2.5** | 2.0 | **never tradeable** |
-| **AXISUSDT** | **2.5** | 2.0 | **never tradeable** |
 
-Each of those two exceeds the entire portfolio beta budget by itself, so the
-gate vetoes them even on an empty book. Related: **no two tradeable symbols can
-be held in the same direction**, which makes `max_open_positions: 2`
-unreachable for same-direction trades.
+This table used to carry two rows marked **never tradeable**: GOATUSDT and
+AXISUSDT both had beta 2.5 against a 2.0 cap, so each exceeded the entire
+budget by itself and the gate vetoed them on an empty book. They were removed,
+for a second and independent reason as well - neither is listed on the data
+venue, so they ingested nothing on every run and produced no signals even
+before the gate saw them. Two defects pointing the same way is usually the
+answer.
 
-`tradingbot doctor` reports this, and a test pins it so a config change is
-noticed. Your options:
-
-* Raise `max_portfolio_btc_beta` to ~3.0 — two positions become possible.
-* Lower the satellite betas — but 2.5 for a thin-book low-cap is honest.
-* Accept it, and treat GOATUSDT and AXISUSDT as analysis-only.
+What remains: **no two symbols can be held in the same direction if their
+combined beta exceeds 2.0**, so `max_open_positions: 2` is reachable only for
+pairs like XRP + BTC, and PEPE at exactly 2.0 can only be held alone. That is
+a deliberate constraint rather than a bug, and a test pins both facts so a
+config change is noticed. If you want two same-direction satellites, raise the
+cap to ~3.0 and accept the correlated drawdown that permits.
 
 ### A second config implication
 
