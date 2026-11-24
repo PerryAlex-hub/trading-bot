@@ -17,9 +17,11 @@ drift from what production runs.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -212,6 +214,18 @@ def refresh_specs() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dump_payload(path: Path | None, payload: dict[str, object]) -> None:
+    """Write the raw venue response, so a failed parse is still diagnostic."""
+    if path is None or not payload:
+        return
+    try:
+        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    except OSError as exc:
+        console.print(f"[yellow]Could not write {path}:[/yellow] {exc}")
+        return
+    console.print(f"[dim]Raw venue payload written to {path}[/dim]")
+
+
 @app.command()
 def minimums(
     max_usdt: float = typer.Option(
@@ -219,6 +233,11 @@ def minimums(
     ),
     limit: int = typer.Option(25, "--limit", help="How many to list"),
     leverage: int = typer.Option(10, "--leverage", help="Leverage for the margin column"),
+    dump: Path | None = typer.Option(
+        None,
+        "--dump",
+        help="Write the raw venue payloads here, whether or not parsing succeeds",
+    ),
 ) -> None:
     """Rank WEEX contracts by the smallest position you can open.
 
@@ -233,11 +252,22 @@ def minimums(
     from .config import load_universe
     from .exchanges.weex_market import WeexMarketData
 
+    # The raw payload is dumped unconditionally, because this command is
+    # routinely run on a machine that can reach WEEX by someone whose helper
+    # cannot. The field names here were taken from WEEX's published docs
+    # rather than observed, so if they are wrong the parsed table comes back
+    # empty and the dump is the only way to find out why without another
+    # round trip.
+    raw: dict[str, object] = {}
     try:
         with WeexMarketData() as client:
-            specs = client.contract_specs(use_cache=False)
+            raw["contracts"] = client.fetch_contracts_raw(use_cache=False)
+            specs = client.contract_specs(use_cache=True)
             marks = client.all_marks()
+            raw["parsed_symbols"] = sorted(specs)[:50]
+            raw["parsed_marks"] = len(marks)
     except Exception as exc:
+        _dump_payload(dump, raw)
         console.print(f"[red]Could not reach WEEX:[/red] {exc}")
         console.print(
             "\nThe market endpoints are public, so this is a network or a "
@@ -246,11 +276,21 @@ def minimums(
         )
         raise typer.Exit(code=1) from exc
 
+    _dump_payload(dump, raw)
+
     if not marks:
         console.print(
             "[yellow]Contract specs loaded but no prices came back[/yellow], so "
             "minimums cannot be converted to USDT. The ticker path has probably "
             "moved; the spec list is fine."
+        )
+        raise typer.Exit(code=1)
+
+    if not specs:
+        console.print(
+            "[yellow]The venue answered but no contracts could be parsed.[/yellow] "
+            "That means the field names differ from the documented ones. Re-run "
+            "with --dump payload.json and send that file."
         )
         raise typer.Exit(code=1)
 
