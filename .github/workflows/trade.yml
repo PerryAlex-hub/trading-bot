@@ -159,7 +159,7 @@ jobs:
             "${HOST}${PATHPART}?symbol=BTCUSDT&interval=4h&limit=1" || echo "000")
           echo "GET ${HOST}${PATHPART} -> HTTP ${CODE}"
           if [ "$CODE" = "451" ]; then
-            echo "::warning::Binance returns 451 (restricted location) from this runner. Set repository variables BINANCE_BASE_URL=https://data-api.binance.vision and BINANCE_USE_FUTURES=false."
+            echo "::notice::Binance returns 451 (restricted location) from this runner, which is expected on GitHub's Azure IPs. The client falls back to https://data-api.binance.vision automatically; no action needed. Check the ingest log for 'falling back to the public data mirror' to confirm."
           elif [ "$CODE" != "200" ]; then
             echo "::warning::Market data host returned HTTP ${CODE}; ingest will likely fail."
           fi
