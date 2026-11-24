@@ -265,3 +265,108 @@ class TestSeriesHealth:
     def test_usability_requires_enough_bars(self) -> None:
         health = check_health(make_frame(n=50, seed=63), "TEST", "4h")
         assert not health.is_usable(min_bars=200)
+
+
+class TestAltBreadth:
+    """The project's answer to BTC dominance, computed from stored candles.
+
+    Literal BTC.D needs market caps and is only published as a current value,
+    so it could never be computed for a past bar. Breadth answers the same
+    question and survives a backtest.
+    """
+
+    def _frame(self, path: list[float]):
+        from .conftest import path_frame
+
+        return path_frame(path)
+
+    def test_counts_the_alts_beating_btc(self) -> None:
+        from tradingbot.analysis.regime import alt_breadth
+
+        btc = self._frame(ramp(100.0, 110.0, 40))      # +10%
+        winner = self._frame(ramp(100.0, 130.0, 40))   # +30%
+        loser = self._frame(ramp(100.0, 102.0, 40))    # +2%
+
+        breadth = alt_breadth(
+            {"WIN": winner, "LOSE": loser}, btc, lookback=30
+        )
+        assert breadth == 0.5
+
+    def test_all_alts_leading_reads_as_one(self) -> None:
+        from tradingbot.analysis.regime import alt_breadth
+
+        btc = self._frame(ramp(100.0, 101.0, 40))
+        alts = {
+            "A": self._frame(ramp(100.0, 140.0, 40)),
+            "B": self._frame(ramp(100.0, 150.0, 40)),
+        }
+        assert alt_breadth(alts, btc, lookback=30) == 1.0
+
+    def test_unknown_with_fewer_than_two_comparable_alts(self) -> None:
+        """A fraction over one symbol is just that symbol."""
+        from tradingbot.analysis.regime import alt_breadth
+
+        btc = self._frame(ramp(100.0, 110.0, 40))
+        assert alt_breadth({"ONLY": self._frame(ramp(100.0, 120.0, 40))}, btc,
+                           lookback=30) is None
+        assert alt_breadth({}, btc, lookback=30) is None
+
+    def test_unknown_when_history_is_shorter_than_the_lookback(self) -> None:
+        from tradingbot.analysis.regime import alt_breadth
+
+        btc = self._frame(ramp(100.0, 110.0, 10))
+        alts = {
+            "A": self._frame(ramp(100.0, 120.0, 10)),
+            "B": self._frame(ramp(100.0, 90.0, 10)),
+        }
+        assert alt_breadth(alts, btc, lookback=30) is None
+
+
+class TestSatelliteLongPermission:
+    """Breadth and ETH/BTC must actually block, not merely annotate."""
+
+    def _regime(self, **overrides):
+        from tradingbot.analysis.regime import MarketRegime, RegimeState
+        from tradingbot.models import Trend
+
+        defaults = dict(
+            state=RegimeState.RISK_ON,
+            btc_trend=Trend.UP,
+            btc_rsi=55.0,
+            btc_atr_pct=2.0,
+            eth_btc_trend=Trend.UP,
+            btc_above_200ema=True,
+            alt_breadth=0.6,
+        )
+        defaults.update(overrides)
+        return MarketRegime(**defaults)
+
+    def test_risk_on_with_healthy_breadth_allows_them(self) -> None:
+        assert self._regime().allows_satellite_longs is True
+
+    def test_narrow_breadth_blocks_even_in_risk_on(self) -> None:
+        """BTC can trend up while capital hides in BTC."""
+        assert self._regime(alt_breadth=0.1).allows_satellite_longs is False
+
+    def test_eth_btc_collapsing_blocks_even_in_risk_on(self) -> None:
+        from tradingbot.models import Trend
+
+        assert self._regime(
+            eth_btc_trend=Trend.STRONG_DOWN
+        ).allows_satellite_longs is False
+
+    def test_a_merely_weak_ratio_does_not_block(self) -> None:
+        from tradingbot.models import Trend
+
+        assert self._regime(eth_btc_trend=Trend.DOWN).allows_satellite_longs is True
+
+    def test_risk_off_still_blocks_regardless_of_breadth(self) -> None:
+        from tradingbot.analysis.regime import RegimeState
+
+        assert self._regime(
+            state=RegimeState.RISK_OFF, alt_breadth=1.0
+        ).allows_satellite_longs is False
+
+    def test_unknown_breadth_does_not_block_on_its_own(self) -> None:
+        """A fresh database should not look like a BTC-only market."""
+        assert self._regime(alt_breadth=None).allows_satellite_longs is True

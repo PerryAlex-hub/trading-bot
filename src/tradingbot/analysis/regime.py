@@ -15,6 +15,7 @@ defeated by a stale constant.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -87,7 +88,29 @@ class MarketRegime:
     # is the classic precondition for altcoins working at all.
     eth_btc_trend: Trend | None
     btc_above_200ema: bool | None
+    # Fraction of the universe's alts outperforming BTC over the lookback.
+    # This is the project's answer to BTC dominance - see `alt_breadth`.
+    alt_breadth: float | None = None
     notes: tuple[str, ...] = ()
+
+    @property
+    def allows_satellite_longs(self) -> bool:
+        """Whether a thin-book long is defensible right now.
+
+        Supersedes `RegimeState.allows_satellite_longs`, which looked only at
+        BTC's own trend. BTC can be trending up while capital hides in BTC, and
+        that is the backdrop where an alt long looks reasonable on its own
+        chart and still bleeds. Both measures here answer "is risk appetite
+        actually travelling out along the curve", which is what `universe.yaml`
+        wanted BTC dominance for.
+        """
+        if not self.state.allows_satellite_longs:
+            return False
+        # ETH/BTC strongly down: BTC is absorbing the flows, so alts lag even
+        # in an up-trend. A merely weak ratio is not enough to block.
+        if self.eth_btc_trend is not None and self.eth_btc_trend is Trend.STRONG_DOWN:
+            return False
+        return not (self.alt_breadth is not None and self.alt_breadth < 0.25)
 
     def describe(self) -> str:
         return (
@@ -98,13 +121,63 @@ class MarketRegime:
         )
 
 
+def alt_breadth(
+    alt_frames: Mapping[str, pd.DataFrame],
+    btc_frame: pd.DataFrame,
+    *,
+    lookback: int = 30,
+) -> float | None:
+    """Fraction of the universe's alts outperforming BTC over `lookback` bars.
+
+    **This is deliberately not literal BTC dominance.** `universe.yaml` listed
+    `BTC.D` as a context feed and nothing ever read it. Implementing the real
+    thing means BTC market cap over total market cap, which needs circulating
+    supplies from a market-data provider - and that route was rejected for a
+    specific reason: such an API serves the CURRENT value, with no history we
+    store. Every backfilled bar and every future backtest would then be scored
+    against today's dominance, which is lookahead bias, and the whole `as_of`
+    discipline elsewhere in this codebase exists to avoid exactly that.
+
+    Breadth answers the same question - is risk appetite travelling out along
+    the curve, or hiding in BTC - from candles already in the database, so it
+    is computable for any past bar and survives a backtest.
+
+    Returns None with fewer than two comparable alts, since a "fraction" over
+    one symbol is just that symbol.
+    """
+    btc_return = _return_over(btc_frame, lookback)
+    if btc_return is None:
+        return None
+
+    outcomes: list[float] = []
+    for frame in alt_frames.values():
+        alt_return = _return_over(frame, lookback)
+        if alt_return is not None:
+            outcomes.append(1.0 if alt_return > btc_return else 0.0)
+
+    if len(outcomes) < 2:
+        return None
+    return sum(outcomes) / len(outcomes)
+
+
+def _return_over(frame: pd.DataFrame, lookback: int) -> float | None:
+    closes = frame["close"].dropna() if "close" in frame else pd.Series(dtype=float)
+    if len(closes) < lookback + 1:
+        return None
+    start = float(closes.iloc[-1 - lookback])
+    if start <= 0:
+        return None
+    return float(closes.iloc[-1]) / start - 1.0
+
+
 def assess_regime(
     btc_frame: pd.DataFrame,
     *,
     eth_frame: pd.DataFrame | None = None,
+    alt_frames: Mapping[str, pd.DataFrame] | None = None,
     high_volatility_atr_pct: float = 4.0,
 ) -> MarketRegime:
-    """Classify the backdrop from BTC, with ETH/BTC as a secondary read."""
+    """Classify the backdrop from BTC, with ETH/BTC and breadth as secondary reads."""
     if btc_frame.empty or len(btc_frame) < 50:
         return MarketRegime(
             state=RegimeState.NEUTRAL,
@@ -157,6 +230,17 @@ def assess_regime(
     if eth_btc_trend is not None and eth_btc_trend.is_down and state is RegimeState.RISK_ON:
         notes.append("ETH/BTC falling: BTC is leading, so alt longs underperform")
 
+    breadth = alt_breadth(alt_frames, btc_frame) if alt_frames else None
+    if breadth is not None:
+        percent = breadth * 100
+        if breadth < 0.25:
+            notes.append(
+                f"only {percent:.0f}% of alts are outperforming BTC: capital is "
+                "concentrating in BTC, so satellite longs are blocked"
+            )
+        elif breadth >= 0.75:
+            notes.append(f"{percent:.0f}% of alts are outperforming BTC: alts are bid")
+
     return MarketRegime(
         state=state,
         btc_trend=structure.trend,
@@ -164,6 +248,7 @@ def assess_regime(
         btc_atr_pct=btc_atr,
         eth_btc_trend=eth_btc_trend,
         btc_above_200ema=above_200,
+        alt_breadth=breadth,
         notes=tuple(notes),
     )
 

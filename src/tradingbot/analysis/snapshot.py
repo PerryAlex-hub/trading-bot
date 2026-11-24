@@ -256,6 +256,8 @@ class FeatureSnapshot:
                     self.regime.eth_btc_trend.value if self.regime.eth_btc_trend else None
                 ),
                 "btc_above_200ema": self.regime.btc_above_200ema,
+                "alt_breadth": _round(self.regime.alt_breadth),
+                "allows_satellite_longs": self.regime.allows_satellite_longs,
                 "notes": list(self.regime.notes),
             },
             "patterns": {

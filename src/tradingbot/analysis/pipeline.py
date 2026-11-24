@@ -238,11 +238,24 @@ def analyse_universe(
     """
     engine = engine or ConfluenceEngine()
 
+    # Breadth needs every symbol at once, which is why it is computed here
+    # rather than inside assess_regime's per-symbol view. BTC itself is
+    # excluded: whether BTC outperforms BTC is not a question.
+    alt_frames = {
+        candidate.symbol: candidate.frames[primary.value]
+        for candidate in symbols
+        if not candidate.symbol.startswith("BTC")
+        and primary.value in candidate.frames
+        and not candidate.frames[primary.value].empty
+    }
+
     regime = _unknown_regime()
     for candidate in symbols:
         if candidate.btc_frame is not None and len(candidate.btc_frame) >= 50:
             regime = assess_regime(
-                candidate.btc_frame, eth_frame=candidate.eth_frame
+                candidate.btc_frame,
+                eth_frame=candidate.eth_frame,
+                alt_frames=alt_frames or None,
             )
             break
 

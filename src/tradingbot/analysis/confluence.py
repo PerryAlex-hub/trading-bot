@@ -671,7 +671,7 @@ class ConfluenceEngine:
         if (
             is_satellite
             and side is Side.LONG
-            and not regime.state.allows_satellite_longs
+            and not regime.allows_satellite_longs
         ):
             blockers.append(
                 f"satellite long blocked: regime is {regime.state.value}, "

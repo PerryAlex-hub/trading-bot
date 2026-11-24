@@ -73,9 +73,23 @@ symbols:
 context:
   - symbol: ETHUSDT
     notes: "ETH/BTC ratio input; alt-risk appetite."
+  # Literal BTC dominance is NOT used, and this entry stays only to record the
+  # decision. Real dominance is BTC market cap over total market cap, which
+  # needs circulating supplies from a market-data provider - and such an API
+  # serves the CURRENT value with no history stored here. Every backfilled bar
+  # and every future backtest would then be judged against today's dominance,
+  # which is exactly the lookahead bias the `as_of` plumbing elsewhere exists
+  # to prevent. A number that cannot be computed for a past bar cannot be part
+  # of a strategy this project is able to evaluate.
+  #
+  # What is implemented instead, from candles already stored, is ALT BREADTH:
+  # the fraction of the universe's alts outperforming BTC over 30 bars. It
+  # answers the same question - is risk appetite travelling out along the
+  # curve, or hiding in BTC - and below 25% it blocks satellite longs outright
+  # via MarketRegime.allows_satellite_longs. See analysis/regime.py.
   - symbol: BTC.D
-    source: derived
-    notes: "BTC dominance. Gates whether satellite longs are sensible at all."
+    source: not_implemented
+    notes: "Superseded by alt breadth, which is backtestable. See analysis/regime.py."
 
 # Timeframes pulled for every symbol. The primary decision timeframe is listed first.
 timeframes:
