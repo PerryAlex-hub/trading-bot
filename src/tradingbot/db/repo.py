@@ -180,6 +180,47 @@ class CandleRepo:
             )
         ).scalar_one_or_none()
 
+    def quote_volume_24h(
+        self, symbol: str, timeframe: str, as_of: datetime | None = None
+    ) -> Decimal | None:
+        """Traded value in the quote currency over the 24h ending at `as_of`.
+
+        Exists so `gates.min_24h_quote_volume` can be enforced. That rule sat
+        in `risk.yaml` for the whole project unread, which is how NILUSDT -
+        0.8M USD of daily volume against a configured 30M floor - stayed in the
+        universe until someone measured it by hand. A liquidity rule nothing
+        reads is not a risk control, it is a comment.
+
+        **This is an approximation**, deliberately. Candles store base-asset
+        volume, so quote volume is summed as `volume x close` per bar rather
+        than from each bar's true VWAP. Within a 4h bar that is close enough
+        to compare against a floor expressed in tens of millions; it is not
+        accurate enough to report as a venue statistic.
+
+        The window ends at the last STORED bar rather than at wall-clock now,
+        so stale data reads as low volume instead of silently shrinking the
+        window to nothing. `as_of` ends it earlier, which keeps a backfilled
+        bar from being judged on volume that had not happened yet.
+
+        Returns None when no bars cover the window, which the gate treats as
+        unknown rather than as a failure.
+        """
+        end = as_of or self.last_open_time(symbol, timeframe)
+        if end is None:
+            return None
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+
+        total = self.session.execute(
+            select(func.sum(Candle.volume * Candle.close)).where(
+                Candle.symbol == symbol,
+                Candle.timeframe == timeframe,
+                Candle.open_time > end - timedelta(hours=24),
+                Candle.open_time <= end,
+            )
+        ).scalar_one_or_none()
+        return None if total is None else Decimal(str(total))
+
     def count(self, symbol: str, timeframe: str) -> int:
         return (
             self.session.execute(

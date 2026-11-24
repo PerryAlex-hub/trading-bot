@@ -434,8 +434,14 @@ def _process(
     with session_scope() as session:
         portfolio = _portfolio_state(session, risk_config)
         spec = ContractSpecRepo(session).get(snapshot.symbol)
-        history_days = CandleRepo(session).history_days(
+        candles = CandleRepo(session)
+        history_days = candles.history_days(
             snapshot.symbol, snapshot.timeframe.value
+        )
+        # Scoped to the bar being analysed so a backfilled bar is judged on the
+        # liquidity that existed then, not on today's.
+        quote_volume_24h = candles.quote_volume_24h(
+            snapshot.symbol, snapshot.timeframe.value, as_of=snapshot.bar_time
         )
 
     quote, funding = _market_data(snapshot.symbol, settings)
@@ -452,6 +458,7 @@ def _process(
         beta=snapshot.beta_to_btc,
         tiers_by_symbol={config.symbol: config.tier for config in universe.symbols},
         history_days=history_days,
+        quote_volume_24h=quote_volume_24h,
         # Signal-only mode never places an order, so a missing quote should not
         # suppress the analysis. Live and paper modes require it.
         require_market_data=settings.trading_mode is not TradingMode.SIGNAL_ONLY,

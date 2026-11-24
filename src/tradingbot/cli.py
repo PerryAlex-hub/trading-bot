@@ -714,13 +714,15 @@ def doctor() -> None:
     # six symbols were in that state for days while every run reported success.
     console.print("\n[bold]Data coverage[/bold]")
     try:
-        from .config import load_universe
+        from .config import load_risk, load_universe
         from .db.engine import session_scope
         from .db.repo import CandleRepo
 
         universe = load_universe()
         primary = universe.primary_timeframe
+        floor = load_risk().decimal("gates", "min_24h_quote_volume", default="0")
         empty: list[str] = []
+        thin: list[str] = []
         with session_scope() as session:
             repo = CandleRepo(session)
             for symbol in universe.symbols_requiring_data():
@@ -729,10 +731,23 @@ def doctor() -> None:
                 if count == 0:
                     empty.append(symbol)
                     console.print(f"  {symbol:<10} [red]no {primary} candles[/red]")
+                    continue
+                volume = repo.quote_volume_24h(symbol, primary)
+                line = f"  {symbol:<10} {count} {primary} bars, {days:.0f} days"
+                if volume is None:
+                    line += ", volume unknown"
                 else:
-                    console.print(
-                        f"  {symbol:<10} {count} {primary} bars, {days:.0f} days"
-                    )
+                    line += f", 24h vol {volume:,.0f}"
+                    if floor > 0 and volume < floor:
+                        thin.append(f"{symbol} ({volume:,.0f})")
+                        line += " [red](below floor)[/red]"
+                console.print(line)
+        if thin:
+            warnings.append(
+                f"below the {floor:,.0f} liquidity floor: {', '.join(thin)}. The "
+                "risk gate vetoes these on gates.min_24h_quote_volume, so they "
+                "will never produce a signal while they stay this thin."
+            )
         if empty:
             problems.append(
                 f"no candles stored for {', '.join(empty)}. These symbols cannot "

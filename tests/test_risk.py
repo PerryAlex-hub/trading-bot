@@ -462,3 +462,59 @@ class TestMinimumSizeOverride:
         assert size.effective_risk_pct == pytest.approx(
             Decimal("0.5"), abs=Decimal("0.01")
         )
+
+
+class TestLiquidityFloor:
+    """gates.min_24h_quote_volume, enforced rather than merely configured."""
+
+    def test_a_thin_book_is_vetoed(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("10000")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+            # NILUSDT's measured figure against a 30,000,000 floor.
+            quote_volume_24h=Decimal("800000"),
+        )
+        assert not decision.approved
+        veto = next(
+            v for v in decision.vetoes if v.rule == "gates.min_24h_quote_volume"
+        )
+        # The number belongs in the message: "too thin" is not reviewable.
+        assert "800,000" in veto.detail
+        # 30,000,000 / 800,000 = 37.5, which formats as 38.
+        assert "38x short" in veto.detail
+
+    def test_a_deep_book_passes(self, risk_config, btc_spec, btc_long) -> None:
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("10000")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+            quote_volume_24h=Decimal("1500000000"),
+        )
+        assert not any(
+            v.rule == "gates.min_24h_quote_volume" for v in decision.vetoes
+        )
+
+    def test_unknown_volume_warns_rather_than_vetoes(
+        self, risk_config, btc_spec, btc_long
+    ) -> None:
+        """A fresh database should not look like an illiquid market."""
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("10000")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+            quote_volume_24h=None,
+        )
+        assert not any(
+            v.rule == "gates.min_24h_quote_volume" for v in decision.vetoes
+        )
+        assert any("24h volume unknown" in w for w in decision.warnings)

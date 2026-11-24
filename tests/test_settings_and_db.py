@@ -22,7 +22,14 @@ from tradingbot.db.repo import (
     RunRepo,
     SignalRepo,
 )
-from tradingbot.models import ContractSpec, Side, SignalStatus, Timeframe, TradeSetup
+from tradingbot.models import (
+    Candle,
+    ContractSpec,
+    Side,
+    SignalStatus,
+    Timeframe,
+    TradeSetup,
+)
 from tradingbot.settings import Settings, TradingMode
 
 from .conftest import make_candles
@@ -566,3 +573,52 @@ class TestMissedBarSelection:
 
     def test_disabled_window_replays_nothing(self) -> None:
         assert self._bars(set(), max_bars=0) == []
+
+
+class TestQuoteVolume:
+    """24h traded value from stored candles, for the liquidity floor.
+
+    The rule this feeds, gates.min_24h_quote_volume, was unread for the whole
+    project. That is how NILUSDT stayed in the universe at 0.8M USD of daily
+    volume against a configured 30M floor.
+    """
+
+    def _store(self, session, *, bars: int, volume: str, close: str) -> None:
+        """Flat candles with known volume, so the sum is exact."""
+        candles = make_candles(n=bars)
+        shaped = [
+            Candle(
+                open_time=c.open_time,
+                open=Decimal(close),
+                high=Decimal(close),
+                low=Decimal(close),
+                close=Decimal(close),
+                volume=Decimal(volume),
+            )
+            for c in candles
+        ]
+        CandleRepo(session).upsert_many("TESTUSDT", "4h", shaped)
+
+    def test_sums_volume_times_close_over_24h(self, session) -> None:
+        # 4h bars, so 24h is 6 bars. 10 units at 2.0 = 20 per bar.
+        self._store(session, bars=20, volume="10", close="2.0")
+        volume = CandleRepo(session).quote_volume_24h("TESTUSDT", "4h")
+        assert volume == Decimal("120")
+
+    def test_window_ends_at_the_last_stored_bar_not_wall_clock(self, session) -> None:
+        """Stale data must read as low volume, not as an empty window."""
+        self._store(session, bars=20, volume="10", close="2.0")
+        repo = CandleRepo(session)
+        last = repo.last_open_time("TESTUSDT", "4h")
+        assert repo.quote_volume_24h("TESTUSDT", "4h", as_of=last) == Decimal("120")
+
+    def test_as_of_excludes_later_bars(self, session) -> None:
+        """A backfilled bar is judged on volume that had already happened."""
+        self._store(session, bars=20, volume="10", close="2.0")
+        repo = CandleRepo(session)
+        candles = repo.latest("TESTUSDT", "4h", limit=100)
+        midpoint = candles[10].open_time
+        assert repo.quote_volume_24h("TESTUSDT", "4h", as_of=midpoint) == Decimal("120")
+
+    def test_unknown_when_nothing_is_stored(self, session) -> None:
+        assert CandleRepo(session).quote_volume_24h("NOPEUSDT", "4h") is None

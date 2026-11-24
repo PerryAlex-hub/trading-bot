@@ -121,6 +121,7 @@ class RiskGate:
         beta: BetaEstimate | None = None,
         tiers_by_symbol: dict[str, Tier] | None = None,
         history_days: float | None = None,
+        quote_volume_24h: Decimal | None = None,
         require_market_data: bool = True,
     ) -> RiskDecision:
         """Return an approval or every reason for refusal."""
@@ -153,6 +154,31 @@ class RiskGate:
                         "before promotion out of paper tier",
                     )
                 )
+
+        # --- 2b. Liquidity floor -----------------------------------------
+        # Enforces gates.min_24h_quote_volume, which went unread for the whole
+        # project. A thin book does not produce a wrong signal, it produces a
+        # correct one that cannot be traded profitably: spread and slippage
+        # take the edge before the setup gets a chance to work. So this is a
+        # veto on the symbol, not a warning about it.
+        minimum_volume = self.config.decimal(
+            "gates", "min_24h_quote_volume", default="0"
+        )
+        if minimum_volume > 0:
+            if quote_volume_24h is None:
+                warnings.append(
+                    "24h volume unknown (no stored candles covering the window), "
+                    "so the liquidity floor could not be checked"
+                )
+            elif quote_volume_24h < minimum_volume:
+                shortfall = minimum_volume / quote_volume_24h if quote_volume_24h > 0 else None
+                detail = (
+                    f"24h quote volume {quote_volume_24h:,.0f} is below the "
+                    f"{minimum_volume:,.0f} floor"
+                )
+                if shortfall is not None:
+                    detail += f" ({shortfall:.0f}x short)"
+                vetoes.append(RiskVeto("gates.min_24h_quote_volume", detail))
 
         # --- 3. Portfolio limits -----------------------------------------
         vetoes.extend(

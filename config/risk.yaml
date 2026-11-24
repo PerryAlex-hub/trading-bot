@@ -76,7 +76,16 @@ circuit_breakers:
 gates:
   # Satellite/paper promotion requirements, checked against stored data.
   min_history_days: 90
-  min_24h_quote_volume: 30000000   # on the venue actually traded, not aggregate
+  # Liquidity floor, in quote currency. ENFORCED as of this change: the gate
+  # computes 24h traded value from stored candles (volume x close per bar) and
+  # vetoes below this. It previously sat here unread, which is how a symbol
+  # with 0.8M of daily volume survived in the universe against this 30M floor
+  # until it was measured by hand. Set to 0 to disable.
+  #
+  # Measured from stored candles, which are Binance's, not WEEX's. Binance is
+  # the deeper venue, so this is the optimistic reading: a book too thin here
+  # is certainly too thin where the trade would actually go.
+  min_24h_quote_volume: 30000000
 
 venue:
   # Assumed minimum order value when the live contract spec is unavailable
