@@ -11,6 +11,14 @@ per_trade:
   risk_pct: 0.5              # % of equity risked per trade (distance to stop)
   min_risk_reward: 2.0       # reject anything below 1:2
   satellite_size_multiplier: 0.5   # satellite tier trades at half size
+  # Small-account reality. At low equity the risk-budget position is often worth
+  # less than the venue minimum, and refusing outright means the bot emits
+  # nothing and therefore learns nothing. Instead the ticket may be issued at
+  # the venue minimum with the REAL risk disclosed on its face, as long as that
+  # stays under max_risk_pct_at_min_size. Above that the trade is still refused:
+  # the point is informed consent, not quietly risking 8% of the account.
+  allow_min_size_override: true
+  max_risk_pct_at_min_size: 2.0
   stop:
     method: atr
     atr_period: 14
@@ -48,6 +56,16 @@ costs:
   assumed_taker_fee_pct: 0.06
   # Expected hold in funding intervals, used to price carry into the R:R check.
   assumed_hold_funding_intervals: 6
+  # Spread assumed when the venue quote is unavailable. This exists because the
+  # alternative was worse: friction was previously computed with a spread of
+  # ZERO whenever the quote was missing, which flattered net R:R exactly when
+  # the least was known. These numbers are deliberately pessimistic, so an
+  # unverifiable setup has to be good enough to survive a bad book before it is
+  # issued as a ticket.
+  assumed_spread_pct:
+    core: 0.05
+    satellite: 0.25
+    default: 0.25
 
 circuit_breakers:
   max_daily_loss_pct: 3.0

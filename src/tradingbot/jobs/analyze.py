@@ -25,8 +25,9 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from ..analysis import SymbolData, analyse_universe
@@ -88,26 +89,39 @@ def run_cycle(
     force: bool = False,
     notify: bool = True,
     primary: Timeframe = Timeframe.H4,
+    as_of: datetime | None = None,
+    track_paper: bool = True,
+    extra_errors: Sequence[str] = (),
 ) -> CycleResult:
     """Run one full analysis cycle.
 
     `force` bypasses the duplicate-bar guard, for manual re-runs.
+
+    `as_of` analyses a specific past bar instead of the current one, using only
+    the data available at that bar. Used by `run_catch_up`.
+
+    `extra_errors` carries problems detected before the cycle started, most
+    importantly failed candle ingest. They are attached to the result so they
+    reach the Telegram run summary, which already fires whenever a cycle
+    reports errors. Discarding them is how two symbols failed to ingest on
+    every run for days without anyone being told.
     """
     settings = settings or get_settings()
     universe = load_universe()
     risk_config = load_risk()
     result = CycleResult()
+    result.errors.extend(extra_errors)
 
     wait_for_database()
 
-    bar_time = _current_bar(primary)
+    bar_time = as_of or _current_bar(primary)
     result.bar_time = bar_time
 
     with session_scope() as session:
-        if not force and RunRepo(session).already_ran(primary.value, bar_time, trigger):
+        if not force and RunRepo(session).already_ran(primary.value, bar_time):
             result.skipped_reason = (
-                f"bar {bar_time:%Y-%m-%d %H:%M} has already been analysed "
-                f"(trigger={trigger}); pass force=True to re-run"
+                f"bar {bar_time:%Y-%m-%d %H:%M} has already been analysed; "
+                "pass force=True to re-run"
             )
             log.info(result.skipped_reason)
             return result
@@ -130,7 +144,7 @@ def run_cycle(
         run_id = run.id
 
     try:
-        snapshots, failures = _analyse(universe, primary)
+        snapshots, failures = _analyse(universe, primary, as_of=as_of)
         result.scanned = len(snapshots)
         result.errors.extend(f"{symbol}: {reason}" for symbol, reason in failures)
 
@@ -144,6 +158,7 @@ def run_cycle(
                     run_id=run_id,
                     result=result,
                     notifier=notifier if notify else None,
+                    track_paper=track_paper,
                 )
             except Exception as exc:
                 log.exception("Processing failed for %s", snapshot.symbol)
@@ -182,21 +197,150 @@ def run_cycle(
     return result
 
 
+@dataclass
+class CatchUpResult:
+    """Outcome of a catch-up pass over bars whose trigger never arrived."""
+
+    current: CycleResult | None = None
+    backfilled: list[CycleResult] = field(default_factory=list)
+    missed_bars: list[datetime] = field(default_factory=list)
+
+    def describe(self) -> str:
+        if not self.backfilled:
+            return "no missed bars"
+        bars = ", ".join(f"{bar:%m-%d %H:%M}" for bar in self.missed_bars)
+        approved = sum(cycle.approved for cycle in self.backfilled)
+        return (
+            f"backfilled {len(self.backfilled)} bar(s) [{bars}], "
+            f"{approved} would have been approved (journalled, not alerted)"
+        )
+
+
+def run_catch_up(
+    *,
+    settings: Settings | None = None,
+    primary: Timeframe = Timeframe.H4,
+    max_bars: int = 6,
+    notify: bool = True,
+    force: bool = False,
+    extra_errors: Sequence[str] = (),
+) -> CatchUpResult:
+    """Analyse the current bar, then any recent bar that was never analysed.
+
+    This exists because GitHub's scheduler is not a clock. Measured over the
+    first 37 hours of deployment, 7 of roughly 46 scheduled triggers arrived,
+    so the 4h analysis ran 3 times instead of 9. Before this function, a
+    trigger that never fired meant that bar was skipped permanently: `run_cycle`
+    only ever looked at `_current_bar`, so two thirds of bars were never
+    examined at all and the journal recorded nothing about them.
+
+    Two deliberate asymmetries between the current bar and a backfilled one:
+
+    * **Only the current bar is alerted.** A signal for a bar that closed eight
+      hours ago is not actionable, and pushing it to Telegram would train you
+      to ignore the channel. Backfilled bars are journalled silently.
+    * **Only the current bar opens a paper position.** See the note in
+      `_process`: a simulated fill on a stale limit order would be fiction.
+
+    Bars are processed oldest-first so the journal reads in chronological
+    order, and the current bar runs last so its Telegram alert is the final
+    thing to arrive.
+    """
+    settings = settings or get_settings()
+    result = CatchUpResult()
+
+    wait_for_database()
+
+    current = _current_bar(primary)
+    step = timedelta(seconds=primary.seconds)
+
+    with session_scope() as session:
+        result.missed_bars = _missed_bars(
+            RunRepo(session),
+            timeframe=primary.value,
+            current=current,
+            step=step,
+            max_bars=max_bars,
+        )
+
+    for bar in result.missed_bars:
+        log.info("Backfilling missed bar %s", bar)
+        cycle = run_cycle(
+            settings=settings,
+            trigger="backfill",
+            primary=primary,
+            as_of=bar,
+            notify=False,
+            track_paper=False,
+        )
+        result.backfilled.append(cycle)
+
+    # The ingest errors ride on the current bar's cycle, not the backfilled
+    # ones: they describe the state of the data now, and the current cycle is
+    # the one that notifies.
+    result.current = run_cycle(
+        settings=settings,
+        trigger="cron",
+        primary=primary,
+        notify=notify,
+        force=force,
+        extra_errors=extra_errors,
+    )
+    return result
+
+
+def _missed_bars(
+    runs: RunRepo,
+    *,
+    timeframe: str,
+    current: datetime,
+    step: timedelta,
+    max_bars: int,
+) -> list[datetime]:
+    """Recent bars with no successful run, oldest-first.
+
+    Walks backwards from the bar before `current` and stops at the first bar
+    that has been analysed. Stopping rather than continuing is deliberate:
+    the bars behind an analysed one were either done too or fell outside an
+    earlier window, and scanning past it would make every run re-examine the
+    whole table for the sake of a gap that will never be filled.
+
+    `max_bars` bounds the replay so one cron tick cannot turn a long outage, or
+    a freshly seeded database, into an unbounded backfill.
+    """
+    if max_bars <= 0:
+        return []
+
+    missed: list[datetime] = []
+    for index in range(1, max_bars + 1):
+        bar = current - step * index
+        if runs.already_ran(timeframe, bar):
+            break
+        missed.append(bar)
+    return sorted(missed)
+
+
 def _analyse(
-    universe: Universe, primary: Timeframe
+    universe: Universe, primary: Timeframe, as_of: datetime | None = None
 ) -> tuple[list[FeatureSnapshot], list[tuple[str, str]]]:
-    """Load candles from the database and run the analysis pipeline."""
+    """Load candles from the database and run the analysis pipeline.
+
+    `as_of` truncates every series at that bar, so a missed bar is analysed
+    with the information available at the time and nothing later.
+    """
     timeframes = list(universe.all_timeframes)
 
     with session_scope() as session:
         repo = CandleRepo(session)
-        btc = repo.latest("BTCUSDT", primary.value, limit=BARS_TO_LOAD)
-        eth = repo.latest("ETHUSDT", primary.value, limit=BARS_TO_LOAD)
+        btc = repo.latest("BTCUSDT", primary.value, limit=BARS_TO_LOAD, as_of=as_of)
+        eth = repo.latest("ETHUSDT", primary.value, limit=BARS_TO_LOAD, as_of=as_of)
 
         payloads: list[SymbolData] = []
         for config in universe.symbols:
             frames = {
-                timeframe: repo.latest(config.symbol, timeframe, limit=BARS_TO_LOAD)
+                timeframe: repo.latest(
+                    config.symbol, timeframe, limit=BARS_TO_LOAD, as_of=as_of
+                )
                 for timeframe in timeframes
             }
             if not frames.get(primary.value):
@@ -224,6 +368,7 @@ def _process(
     run_id: int | None,
     result: CycleResult,
     notifier: TelegramNotifier | None,
+    track_paper: bool = True,
 ) -> None:
     """Take one snapshot from verdict to journal entry (and maybe an order)."""
     features = snapshot.to_dict()
@@ -342,6 +487,8 @@ def _process(
                     side=snapshot.side,
                     decision=decision,
                     score=snapshot.score,
+                    setup=setup,
+                    reasons=tuple(snapshot.confluence.top_reasons()),
                 )
             )
         return
@@ -385,7 +532,13 @@ def _process(
     # simulated position is opened so the journal can later score this
     # prediction in R, which is the only way to learn whether the analysis is
     # worth anything.
-    if settings.tracks_paper_positions and size is not None:
+    # A backfilled bar passes track_paper=False. Opening a simulated position
+    # from a bar that closed hours ago would invent a fill: the entry is a
+    # limit order that may never have been touched, and reconstructing whether
+    # it filled needs a tick-level replay, which is the backtest harness's job
+    # rather than something to fake here. The signal and its reasoning are
+    # still journalled, which is the part worth having.
+    if track_paper and settings.tracks_paper_positions and size is not None:
         with session_scope() as session:
             stored_signal = SignalRepo(session).get(signal_id)
             if stored_signal is not None:

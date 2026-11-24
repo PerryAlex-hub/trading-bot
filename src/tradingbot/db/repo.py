@@ -126,20 +126,31 @@ class CandleRepo:
         return written
 
     def latest(
-        self, symbol: str, timeframe: str, limit: int = 500
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 500,
+        as_of: datetime | None = None,
     ) -> list[CandleValue]:
         """The most recent `limit` closed bars, returned oldest-first.
 
         Indicators need chronological order, but the database can only serve
         "most recent" efficiently, so the slice is taken descending and then
         reversed.
+
+        `as_of` truncates the series at that bar's open time, which is what
+        makes catch-up analysis of a missed bar honest: the indicators then see
+        exactly what they would have seen at the time, with no knowledge of
+        bars that closed afterwards. Without it, re-analysing an old bar with
+        today's data is lookahead bias dressed up as a backfill, and every
+        journalled result from it would be worthless.
         """
-        statement = (
-            select(Candle)
-            .where(Candle.symbol == symbol, Candle.timeframe == timeframe)
-            .order_by(Candle.open_time.desc())
-            .limit(limit)
+        statement = select(Candle).where(
+            Candle.symbol == symbol, Candle.timeframe == timeframe
         )
+        if as_of is not None:
+            statement = statement.where(Candle.open_time <= as_of)
+        statement = statement.order_by(Candle.open_time.desc()).limit(limit)
         rows = list(self.session.execute(statement).scalars())
         rows.reverse()
         return [self._to_value(row) for row in rows]
@@ -314,24 +325,28 @@ class RunRepo:
         run.error = error[-4000:] if error else None
         self.session.flush()
 
-    def already_ran(self, timeframe: str, bar_time: datetime, trigger: str) -> bool:
+    def already_ran(
+        self, timeframe: str, bar_time: datetime, trigger: str | None = None
+    ) -> bool:
         """Whether this exact bar has already been analysed.
 
         GitHub Actions can fire a schedule more than once, and a manual run can
         overlap a cron one. Without this check a duplicate run would re-notify
         and, worse, re-attempt execution.
+
+        `trigger=None` asks whether ANY run covered the bar, which is what the
+        catch-up pass needs: a bar analysed by cron must not be re-analysed by
+        a backfill, and scoping the check to one trigger would let exactly that
+        happen.
         """
-        return (
-            self.session.execute(
-                select(AnalysisRun.id).where(
-                    AnalysisRun.timeframe == timeframe,
-                    AnalysisRun.bar_time == bar_time,
-                    AnalysisRun.trigger == trigger,
-                    AnalysisRun.ok.is_(True),
-                )
-            ).first()
-            is not None
+        statement = select(AnalysisRun.id).where(
+            AnalysisRun.timeframe == timeframe,
+            AnalysisRun.bar_time == bar_time,
+            AnalysisRun.ok.is_(True),
         )
+        if trigger is not None:
+            statement = statement.where(AnalysisRun.trigger == trigger)
+        return self.session.execute(statement).first() is not None
 
     def recent(self, limit: int = 20) -> list[AnalysisRun]:
         return list(

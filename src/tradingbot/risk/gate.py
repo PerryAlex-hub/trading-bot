@@ -16,10 +16,13 @@ tells you something that "rejected: correlation" does not.
 bot is a series of short-lived cron jobs, so "how many positions are open" is
 not a fact this process can know on its own.
 
-**Unknown is treated as blocking, not as permission.** If the spread cannot be
-fetched, the trade is rejected. The alternative - assuming a benign default -
-means the one time WEEX's ticker endpoint is down is the one time the bot
-places an order into a 5% spread.
+**Unknown is priced, not assumed away.** Missing market data used to be a hard
+veto. That silenced the bot completely whenever the WEEX ticker was
+unreachable, which is not a safety property in a project with no execution
+path - it just produced an empty journal. Unknown friction is now charged at a
+deliberately pessimistic rate, so a setup must survive a bad assumed book to be
+reported, and the resulting rejection names the economics rather than the
+outage. What is never done is assuming unknown costs are zero.
 """
 
 from __future__ import annotations
@@ -158,7 +161,7 @@ class RiskGate:
 
         # --- 4. Market-data-dependent costs ------------------------------
         vetoes.extend(
-            self._check_costs(setup, quote, funding, require_market_data, warnings)
+            self._check_costs(setup, tier, quote, funding, require_market_data, warnings)
         )
 
         # --- 5. Sizing ----------------------------------------------------
@@ -180,7 +183,19 @@ class RiskGate:
             fallback_min_notional=self.config.decimal(
                 "venue", "fallback_min_notional_usdt", default="5.0"
             ),
+            allow_min_size_override=bool(
+                self.config.get("per_trade", "allow_min_size_override", default=False)
+            ),
+            max_risk_pct_at_min_size=self.config.decimal(
+                "per_trade", "max_risk_pct_at_min_size", default="2.0"
+            ),
         )
+        if size.viable and size.at_venue_minimum:
+            warnings.append(
+                f"sized at the venue minimum, so this risks "
+                f"{size.effective_risk_pct:.2f}% of equity rather than the "
+                f"configured {self.config.risk_pct}%"
+            )
         if not size.viable:
             vetoes.append(RiskVeto("sizing.unviable", size.reason))
 
@@ -188,7 +203,9 @@ class RiskGate:
         # Checked last because it needs the sized quantity, and only when
         # sizing succeeded.
         if size.viable:
-            vetoes.extend(self._check_net_rr(setup, size, quote, funding, warnings))
+            vetoes.extend(
+                self._check_net_rr(setup, tier, size, quote, funding, warnings)
+            )
 
         if regime is not None and regime.notes:
             warnings.extend(regime.notes)
@@ -324,6 +341,7 @@ class RiskGate:
     def _check_costs(
         self,
         setup: TradeSetup,
+        tier: Tier,
         quote: Quote | None,
         funding: FundingInfo | None,
         require_market_data: bool,
@@ -331,21 +349,37 @@ class RiskGate:
     ) -> list[RiskVeto]:
         """Spread and funding checks.
 
-        Missing data is a veto when `require_market_data`. Failing closed is the
-        only safe default: a bot that assumes a tight spread when it cannot
-        measure one will eventually place an order into a blown-out book.
+        A missing quote used to be a hard veto here, on the reasoning that
+        assuming a tight spread would eventually put an order into a blown-out
+        book. That reasoning does not survive contact with this project: there
+        is no execution path, so nothing is ever placed into any book. What the
+        veto actually did was suppress every signal whenever the WEEX ticket
+        endpoint was unreachable, which is what happened on the first live
+        deployment - six symbols, six `costs.spread_unknown` rejections, an
+        empty journal and nothing to learn from.
+
+        So an unverifiable spread is now a warning, and the cost of not knowing
+        is priced in instead: `_check_net_rr` charges a deliberately pessimistic
+        assumed spread for the tier. A setup that still clears the R:R floor
+        against a bad assumed book is worth reporting; one that does not is
+        rejected for being uneconomic, which is a far more useful reason than
+        "the ticker was down".
         """
         vetoes: list[RiskVeto] = []
 
         max_spread = self.config.decimal("costs", "max_spread_pct", default="0.10")
         if quote is None:
+            assumed = self.config.assumed_spread_pct(tier)
+            warnings.append(
+                f"no venue quote available: spread unverified, so friction is "
+                f"priced at the assumed {assumed}% for {tier.value} tier. "
+                f"Check the book before entering."
+            )
             if require_market_data:
-                vetoes.append(
-                    RiskVeto(
-                        "costs.spread_unknown",
-                        "no live quote available, so spread cannot be verified "
-                        "(failing closed rather than assuming it is tight)",
-                    )
+                log.warning(
+                    "%s: no WEEX quote; proceeding with an assumed %s%% spread",
+                    setup.symbol,
+                    assumed,
                 )
         else:
             spread = quote.spread_pct
@@ -408,17 +442,34 @@ class RiskGate:
     def _check_net_rr(
         self,
         setup: TradeSetup,
+        tier: Tier,
         size: PositionSize,
         quote: Quote | None,
         funding: FundingInfo | None,
         warnings: list[str],
     ) -> list[RiskVeto]:
-        """Risk:reward after friction, which is the only R:R that matters."""
+        """Risk:reward after friction, which is the only R:R that matters.
+
+        Missing market data is charged at a pessimistic assumed rate rather
+        than at zero. Treating an unknown spread as free was a real bug: it
+        made net R:R look best in exactly the situation where the least was
+        known, so an unverifiable setup was easier to approve than a verified
+        one with a measured 0.08% spread.
+        """
         minimum = self.config.min_risk_reward
         gross = setup.risk_reward()
 
-        spread_pct = quote.spread_pct if quote is not None else Decimal("0")
-        funding_pct = funding.rate_8h_pct if funding is not None else Decimal("0")
+        spread_assumed = quote is None
+        spread_pct = (
+            quote.spread_pct if quote is not None
+            else self.config.assumed_spread_pct(tier)
+        )
+        # Funding is directional: unknown funding is charged as a cost rather
+        # than assumed to be a tailwind.
+        funding_pct = (
+            funding.rate_8h_pct if funding is not None
+            else self.config.decimal("costs", "max_abs_funding_rate_8h", default="0.05")
+        )
         friction = friction_cost(
             notional=size.notional,
             taker_fee_pct=self.config.decimal(
@@ -433,12 +484,16 @@ class RiskGate:
         net = net_risk_reward(setup, size, friction)
 
         if net < minimum:
+            basis = (
+                f"assumed {spread_pct}% spread" if spread_assumed
+                else f"measured {spread_pct:.4f}% spread"
+            )
             return [
                 RiskVeto(
                     "per_trade.min_risk_reward",
                     f"net risk:reward {net:.2f} is below the {minimum} floor "
                     f"(gross {gross:.2f}, friction {friction:.4f} USDT on a "
-                    f"{size.notional:.2f} USDT position)",
+                    f"{size.notional:.2f} USDT position, {basis})",
                 )
             ]
 

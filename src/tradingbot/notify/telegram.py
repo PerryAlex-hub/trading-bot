@@ -92,58 +92,123 @@ class TelegramNotifier:
         warnings: tuple[str, ...] = (),
         is_paper: bool = True,
         executed: bool = False,
+        base_asset: str | None = None,
     ) -> str:
-        """Format an approved signal.
+        """Format an approved signal as an order ticket.
 
-        Leads with the mode, because the single most important thing to know at
-        a glance is whether real money just moved.
+        Laid out in the order the fields appear when opening a position on the
+        venue - direction, order type, leverage and margin mode, quantity,
+        margin, then TP/SL - so the message can be transcribed top to bottom
+        without rereading it. The previous layout listed the analysis first and
+        the numbers you actually need second, which is backwards for something
+        read on a phone.
+
+        Nothing here places an order. The ticket is a recommendation to be
+        entered by hand, which is why it states the inputs rather than just the
+        conclusion.
         """
-        arrow = "LONG" if setup.side is Side.LONG else "SHORT"
-        mode = "PAPER" if is_paper else "*LIVE*"
-        header = f"{'EXECUTED' if executed else 'SIGNAL'} [{mode}] {arrow} {symbol}"
+        direction = "LONG" if setup.side is Side.LONG else "SHORT"
+        unit = base_asset or _base_of(symbol)
+        mode = "PAPER" if is_paper else "LIVE"
 
         lines = [
-            header,
-            f"_{tier} tier | score {score:+.3f} | {setup.timeframe.value}_",
+            f"{'TRACKED' if executed else 'SIGNAL'} [{mode}] {direction} {symbol}",
+            f"_{tier} tier | {setup.timeframe.value} | score {score:+.3f}_",
             "",
-            f"Entry  `{_fmt(setup.entry)}`",
-            f"Stop   `{_fmt(setup.stop)}`  ({_pct(setup.stop, setup.entry)})",
+            "*ORDER*",
+            f"`{'Open ' + direction.title():<12}` Limit",
         ]
+
+        if size is not None and size.viable:
+            lines += [
+                f"`{'Entry':<12}` {_fmt(setup.entry)}",
+                f"`{'Leverage':<12}` {_fmt(size.leverage)}x isolated",
+                f"`{'Quantity':<12}` {_fmt(size.quantity)} {unit}",
+                f"`{'Order value':<12}` {_fmt(size.notional)} USDT",
+                f"`{'Margin':<12}` {_fmt(size.margin)} USDT",
+            ]
+        else:
+            lines.append(f"`{'Entry':<12}` {_fmt(setup.entry)}")
+
+        lines += ["", "*TP / SL*"]
+        lines.append(
+            f"`{'Stop loss':<12}` {_fmt(setup.stop)}  "
+            f"({_pct(setup.stop, setup.entry)})"
+        )
         for index, target in enumerate(setup.targets, start=1):
+            label = "Take profit" if len(setup.targets) == 1 else f"Take profit {index}"
             lines.append(
-                f"T{index}     `{_fmt(target)}`  ({_pct(target, setup.entry)}, "
+                f"`{label:<12}` {_fmt(target)}  ({_pct(target, setup.entry)}, "
                 f"{setup.risk_reward(target):.2f}R)"
             )
 
         if size is not None and size.viable:
-            lines += [
-                "",
-                f"Size   `{_fmt(size.quantity)}` ({_fmt(size.notional)} USDT @ {size.leverage}x)",
-                f"Margin `{_fmt(size.margin)}` USDT | risking `{_fmt(size.risk_amount)}` USDT",
-            ]
+            risk_line = f"`{'Risk':<12}` {_fmt(size.risk_amount)} USDT"
+            if size.effective_risk_pct is not None:
+                risk_line += f" ({size.effective_risk_pct:.2f}% of equity)"
+            lines += ["", "*RISK*", risk_line]
+            if size.at_venue_minimum:
+                lines.append(
+                    f"`{'Note':<12}` sized up to the venue minimum, so this "
+                    "risks more than the configured budget"
+                )
 
         if reasons:
-            lines += ["", "*Why:*"] + [f"- {reason}" for reason in reasons[:5]]
+            lines += ["", "*ANALYSIS*"] + [f"- {reason}" for reason in reasons[:6]]
         if warnings:
-            lines += ["", "*Caution:*"] + [f"- {warning}" for warning in warnings[:4]]
+            lines += ["", "*CHECK BEFORE ENTERING*"] + [
+                f"- {warning}" for warning in warnings[:4]
+            ]
 
         return "\n".join(lines)
 
     def rejection_message(
-        self, *, symbol: str, side: Side, decision: RiskDecision, score: float
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        decision: RiskDecision,
+        score: float,
+        setup: TradeSetup | None = None,
+        reasons: tuple[str, ...] = (),
     ) -> str:
         """Format a rejected candidate.
 
         Worth sending: a rejection tells you the bot saw the setup and why it
         declined, which is the difference between a working filter and a bot
         that has silently stopped finding anything.
+
+        The setup it *would* have taken is included when known. A rejection
+        that shows the levels and the reasoning is reviewable - you can judge
+        whether the veto was right. One that shows only a rule name is not.
         """
         lines = [
             f"REJECTED {side.value.upper()} {symbol}",
             f"_score {score:+.3f}_",
-            "",
-            "*Failed rules:*",
         ]
+
+        if setup is not None:
+            lines += [
+                "",
+                "*WOULD HAVE BEEN*",
+                f"`{'Entry':<12}` {_fmt(setup.entry)}",
+                f"`{'Stop loss':<12}` {_fmt(setup.stop)}  "
+                f"({_pct(setup.stop, setup.entry)})",
+            ]
+            for index, target in enumerate(setup.targets, start=1):
+                label = (
+                    "Take profit" if len(setup.targets) == 1
+                    else f"Take profit {index}"
+                )
+                lines.append(
+                    f"`{label:<12}` {_fmt(target)}  ({_pct(target, setup.entry)}, "
+                    f"{setup.risk_reward(target):.2f}R)"
+                )
+
+        if reasons:
+            lines += ["", "*ANALYSIS*"] + [f"- {reason}" for reason in reasons[:4]]
+
+        lines += ["", "*BLOCKED BY*"]
         lines += [f"- `{veto.rule}`: {veto.detail}" for veto in decision.vetoes[:6]]
         return "\n".join(lines)
 
@@ -233,6 +298,14 @@ def _fmt(value: Decimal | float | None) -> str:
     # normalize() strips trailing zeros but can re-introduce exponent form on
     # integers (1E+2), so reformat with "f" afterwards.
     return format(rounded.normalize(), "f")
+
+
+def _base_of(symbol: str) -> str:
+    """The unit a quantity is denominated in, for the ticket."""
+    for quote in ("USDT", "USDC", "USD"):
+        if symbol.endswith(quote):
+            return symbol[: -len(quote)]
+    return symbol
 
 
 def _pct(value: Decimal, reference: Decimal) -> str:

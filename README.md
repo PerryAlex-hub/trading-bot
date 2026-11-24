@@ -483,6 +483,87 @@ are now the only evidence the bot produces about itself.
 
 ---
 
+## Three more the first live deployment found
+
+The first real run produced six symbols and six rejections, five of them for
+the same reason. That is not a market with no setups; it is a bug.
+
+5. **An unreachable ticker silenced the whole bot.** A missing venue quote was
+   a hard veto (`costs.spread_unknown`), justified as failing closed. But this
+   project has no execution path, so there was no order to protect — the veto
+   only guaranteed an empty journal whenever WEEX was unreachable, which is the
+   one state in which you most need the analysis recorded. Unknown friction is
+   now *priced* at a pessimistic `costs.assumed_spread_pct` for the tier, so a
+   setup must survive a bad assumed book to be reported, and a rejection names
+   the economics instead of the outage.
+6. **Unknown spread was charged as zero.** Separately, and worse: when the
+   quote was missing, `friction_cost` received `spread_pct=0`. Net R:R looked
+   *best* exactly when the least was known, so an unverifiable setup was easier
+   to approve than a verified one with a measured 0.08% spread. Unknown funding
+   was free too. Both are now charged at conservative rates.
+7. **Sizing dead-ended on small accounts.** At 50 USDT equity the 0.5% budget
+   is 0.25 USDT, and a 3x ATR satellite stop implies a position worth about 3
+   USDT against a 5 USDT floor — permanently unviable, on every bar, with no
+   path to a signal. The floor can now be cleared at the venue minimum with the
+   real risk disclosed on the ticket (`per_trade.allow_min_size_override`),
+   capped by `max_risk_pct_at_min_size` so the account cannot be quietly put at
+   8% risk. Above that ceiling it still refuses, and says what equity the setup
+   would need.
+
+The shared lesson: **failing closed is a property of systems that can act.** In
+a system that only reports, the same instinct just destroys the evidence. Rules
+7 and 5 together are why `tradingbot doctor` now probes the venue and says
+whether specs and quotes are actually arriving.
+
+---
+
+## The scheduler is not a clock
+
+Measured against the GitHub API over the first 37 hours of deployment:
+
+| | Expected | Delivered |
+|---|---|---|
+| analyse (6/day) | ~9 | **3** |
+| monitor (24/day) | ~37 | **4** |
+
+Seven scheduled runs out of roughly forty-six, each 25-65 minutes late,
+arriving in a strict analyse/monitor alternation. Every run that did arrive
+succeeded, so nothing in the Actions tab looked wrong. Two causes:
+
+1. **Both crons shared one workflow file**, so they shared one concurrency
+   group and took turns. They are now `trade.yml` (analyse) and `monitor.yml`,
+   with separate groups. `trade.yml` keeps its path deliberately: GitHub keys a
+   workflow's run history to its file path, so renaming it would have orphaned
+   the history.
+2. **GitHub drops scheduled triggers** on free public repos under load. It
+   documents the delay, not the drops. Separating the files removes the
+   self-inflicted half; the rest is not fixable from inside the repo.
+
+So the schedule now sets the *cadence*, not the *coverage*. `analyse` opens by
+catching up: `_missed_bars` walks back up to `--backfill` bars (default 6),
+stopping at the first bar with a successful run, and analyses each one with
+`as_of` set so the series is truncated at that bar. One surviving run per day
+fills the journal for the whole day.
+
+Two asymmetries between a backfilled bar and the current one, both deliberate:
+
+* **Only the current bar is alerted.** A signal for a bar that closed eight
+  hours ago is not actionable, and pushing it to Telegram would train you to
+  ignore the channel.
+* **Only the current bar opens a paper position.** A simulated fill on a stale
+  limit order would be fiction - whether it ever traded needs a tick-level
+  replay, which is the backtest harness's job. The signal and its reasoning are
+  still journalled, which is the part worth having.
+
+The `as_of` truncation is what makes this honest rather than lookahead bias
+wearing a backfill costume, and it is pinned by `TestAsOfReads`. If reliable
+timing ever matters more than this, drive `workflow_dispatch` from the
+cron-job.org account that already pings the API - the endpoint is in the header
+of `monitor.yml`. That makes GitHub the executor and something else the clock,
+which is the right split, because the clock is the part that fails.
+
+---
+
 ## Roadmap
 
 0. **Data + journal** — done

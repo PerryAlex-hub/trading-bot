@@ -1,0 +1,104 @@
+# Position monitor. Resolves open paper positions against recent candles and
+# checks the circuit breakers. Cheap: exits in seconds when nothing is open.
+#
+# Split out of trade.yml because the two crons shared one concurrency group and
+# most scheduled triggers were not arriving - 7 runs out of ~46 expected over
+# the first 37 hours, alternating between the two schedules.
+#
+# DO NOT TRUST GITHUB CRON FOR TIMING. Scheduled workflows on free public
+# repositories are delayed under load and dropped outright with no record, and
+# GitHub documents the delay but not the drops. Separating the files removes
+# the self-inflicted contention; it does not make the scheduler reliable.
+#
+# If reliable cadence matters, drive it externally. There is already a
+# cron-job.org pinger keeping the Render service awake, and the same free
+# account can POST this workflow instead:
+#
+#   POST https://api.github.com/repos/<owner>/<repo>/actions/workflows/monitor.yml/dispatches
+#   Authorization: Bearer <fine-grained PAT with actions:write on this repo>
+#   Content-Type: application/json
+#   {"ref": "master", "inputs": {}}
+#
+# That turns GitHub into the executor and something else into the clock, which
+# is the right division: the clock is the part that is failing.
+#
+# Minutes are not a constraint while this repository is public (Actions minutes
+# are unlimited for public repos). If it is ever made private, the 2,000
+# min/month budget and GitHub's default $0 spending limit become a hard stop -
+# see the budget note in trade.yml before changing this schedule.
+
+name: monitor
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: monitor-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      ENVIRONMENT: production
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DATABASE_DIRECT_URL: ${{ secrets.DATABASE_DIRECT_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TRADING_MODE: ${{ vars.TRADING_MODE || 'paper' }}
+      LOG_LEVEL: ${{ vars.LOG_LEVEL || 'INFO' }}
+      BINANCE_BASE_URL: ${{ vars.BINANCE_BASE_URL }}
+      BINANCE_USE_FUTURES: ${{ vars.BINANCE_USE_FUTURES || 'true' }}
+      CONFIG_DIR: ${{ github.workspace }}/config
+      # A literal path, not ${{ runner.temp }}: the `runner` context does not
+      # exist in a job-level env block, and referencing it there makes the
+      # whole workflow file invalid, so every run fails at startup before a
+      # single step executes. That mistake cost three startup_failure runs on
+      # the first deployment.
+      CACHE_DIR: /tmp/tradingbot-cache
+      GIT_SHA: ${{ github.sha }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+
+      - name: Fail fast if the database is not configured
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. Add the POOLED Neon connection string (the host containing '-pooler')."
+            exit 1
+          fi
+
+      - name: Monitor
+        run: tradingbot monitor
+
+      # A failed scheduled run is otherwise completely silent: nobody watches
+      # the Actions tab, and a monitor that has quietly stopped resolving
+      # positions looks exactly like positions that have not hit anything yet.
+      - name: Notify on failure
+        if: failure() && env.TELEGRAM_BOT_TOKEN != ''
+        run: |
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=BOT FAILURE: monitor job failed. See GitHub Actions run ${{ github.run_id }}." \
+            > /dev/null || true

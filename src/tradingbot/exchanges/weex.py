@@ -34,26 +34,59 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://api-contract.weex.com"
 
 # Tried in order until one returns a usable contract list.
+#
+# The `/api/swap/v3/` prefix is the one WEEX's own futures REST documentation
+# publishes. The `/capi/` paths below it are kept only as fallbacks and are
+# known to be wrong: every one of them returns a Spring "Whitelabel Error
+# Page" 404, which means the service is up and has no such mapping. They were
+# assembled from search results and third-party SDKs rather than the docs, and
+# they are the reason every deployed run reported "no live quote available"
+# and "no live contract spec available". A probe list is only as good as its
+# first entry.
 CONTRACT_INFO_PATHS: tuple[str, ...] = (
+    "/api/swap/v3/market/contracts",
     "/capi/v3/market/contracts",
     "/capi/v2/market/contracts",
-    "/capi/v3/market/exchangeInfo",
-    "/capi/v1/market/contracts",
 )
 
 KLINE_PATHS: tuple[str, ...] = (
+    "/api/swap/v3/market/candles",
     "/capi/v3/market/klines",
     "/capi/v2/market/candles",
 )
 
-# Field-name candidates, most specific first. WEEX, ccxt and the community
-# SDKs all spell these differently.
+# Field names, taken from WEEX's published futures response fields. The
+# documented contract payload has NO explicit minimum-order field: WEEX
+# futures are contract-denominated, so the smallest order is one contract and
+# its size in the base asset is `contract_val`. That is why BTC's minimum
+# works out at roughly 6 USDT - 0.0001 BTC per contract at ~60,000 - and it
+# means the cheapest contract to open is a question about price, not about
+# some venue-wide dollar floor.
 _SYMBOL_KEYS = ("symbol", "symbolName", "contract_code", "contractCode", "instrument_id")
-_MIN_SIZE_KEYS = ("minOrderSize", "min_order_size", "minTradeNum", "minOrderQty", "minQty", "sizeMin")
-_MIN_NOTIONAL_KEYS = ("minOrderValue", "min_order_value", "minNotional", "minTradeValue", "minAmount")
-_SIZE_STEP_KEYS = ("sizeMultiplier", "sizeStep", "stepSize", "volumePlace", "sizeIncrement", "qtyStep")
-_PRICE_STEP_KEYS = ("priceEndStep", "tickSize", "priceStep", "pricePlace", "priceIncrement")
-_MAX_LEV_KEYS = ("maxLeverage", "max_leverage", "leverageMax", "initLeverage")
+_MIN_SIZE_KEYS = (
+    "contract_val",      # documented: base-asset value of one contract
+    "contractVal",
+    "minOrderSize",
+    "min_order_size",
+    "minTradeNum",
+    "minQty",
+)
+_MIN_NOTIONAL_KEYS = ("minOrderValue", "min_order_value", "minNotional", "minTradeValue")
+_SIZE_STEP_KEYS = (
+    "size_increment",    # documented: quantity precision
+    "sizeIncrement",
+    "sizeMultiplier",
+    "stepSize",
+    "volumePlace",
+)
+_PRICE_STEP_KEYS = (
+    "tick_size",         # documented: price precision
+    "tickSize",
+    "priceEndStep",
+    "priceStep",
+    "pricePlace",
+)
+_MAX_LEV_KEYS = ("maxLeverage", "max_leverage", "leverageMax")
 
 
 class WeexEndpointError(RuntimeError):

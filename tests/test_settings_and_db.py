@@ -434,3 +434,135 @@ class TestAccountRepo:
         repo = AccountRepo(session)
         repo.snapshot(equity=Decimal("200"), is_paper=True)
         assert repo.equity_at_day_start() == Decimal("200")
+
+
+class TestAsOfReads:
+    """Catch-up analysis must not see bars that closed after the one it is on.
+
+    This is the guard that makes backfilling honest. Re-analysing a missed bar
+    with today's candles would score the setup against its own outcome, and
+    every journalled result from such a run would be worthless.
+    """
+
+    def test_as_of_truncates_the_series(self, session) -> None:
+        candles = make_candles(n=40)
+        repo = CandleRepo(session)
+        repo.upsert_many("BTCUSDT", "4h", candles)
+
+        cutoff = candles[20].open_time
+        visible = repo.latest("BTCUSDT", "4h", limit=500, as_of=cutoff)
+
+        assert visible[-1].open_time == cutoff
+        assert len(visible) == 21
+        assert all(candle.open_time <= cutoff for candle in visible)
+
+    def test_as_of_none_is_unchanged(self, session) -> None:
+        candles = make_candles(n=25)
+        repo = CandleRepo(session)
+        repo.upsert_many("BTCUSDT", "4h", candles)
+
+        assert len(repo.latest("BTCUSDT", "4h", limit=500)) == 25
+
+    def test_as_of_still_respects_the_limit(self, session) -> None:
+        """The limit applies to the truncated window, newest-first."""
+        candles = make_candles(n=40)
+        repo = CandleRepo(session)
+        repo.upsert_many("BTCUSDT", "4h", candles)
+
+        cutoff = candles[30].open_time
+        visible = repo.latest("BTCUSDT", "4h", limit=5, as_of=cutoff)
+
+        assert len(visible) == 5
+        assert visible[-1].open_time == cutoff
+
+
+class TestBarCompletionIgnoresTrigger:
+    """A bar done by cron must not be re-done by a backfill.
+
+    `already_ran` was scoped to one trigger, which is right for its original
+    job (letting `--force` and a failed-run retry through) but wrong for the
+    catch-up pass: scoping by trigger would make every cron-analysed bar look
+    unanalysed to the backfill and the journal would fill with duplicates.
+    """
+
+    def _complete(self, session, bar_time, trigger: str) -> None:
+        repo = RunRepo(session)
+        run = repo.start(trigger=trigger, bar_time=bar_time, timeframe="4h")
+        repo.finish(run, ok=True)
+
+    def test_any_trigger_counts_when_trigger_is_unspecified(self, session) -> None:
+        bar = dt.datetime(2026, 11, 24, 8, tzinfo=dt.UTC)
+        self._complete(session, bar, "cron")
+
+        repo = RunRepo(session)
+        assert repo.already_ran("4h", bar) is True
+        assert repo.already_ran("4h", bar, "backfill") is False
+        assert repo.already_ran("4h", bar, "cron") is True
+
+    def test_an_unanalysed_bar_is_reported_missing(self, session) -> None:
+        bar = dt.datetime(2026, 11, 24, 8, tzinfo=dt.UTC)
+        assert RunRepo(session).already_ran("4h", bar) is False
+
+    def test_a_failed_run_does_not_count_as_done(self, session) -> None:
+        """Otherwise a transient failure would permanently skip that bar."""
+        bar = dt.datetime(2026, 11, 24, 12, tzinfo=dt.UTC)
+        repo = RunRepo(session)
+        run = repo.start(trigger="cron", bar_time=bar, timeframe="4h")
+        repo.finish(run, ok=False, error="boom")
+
+        assert repo.already_ran("4h", bar) is False
+
+
+class TestMissedBarSelection:
+    """Which bars a catch-up pass decides to replay.
+
+    The deployed scheduler delivered 7 of ~46 expected triggers in 37 hours,
+    so this selection is the difference between analysing 3 bars a day and
+    analysing all 6.
+    """
+
+    class FakeRuns:
+        def __init__(self, done: set) -> None:
+            self.done = done
+
+        def already_ran(self, timeframe, bar_time, trigger=None) -> bool:
+            return bar_time in self.done
+
+    def _bars(self, done: set, *, max_bars: int = 6):
+        from tradingbot.jobs.analyze import _missed_bars
+
+        current = dt.datetime(2026, 11, 24, 12, tzinfo=dt.UTC)
+        return _missed_bars(
+            self.FakeRuns(done),
+            timeframe="4h",
+            current=current,
+            step=dt.timedelta(hours=4),
+            max_bars=max_bars,
+        )
+
+    def test_finds_every_gap_up_to_the_window(self) -> None:
+        missed = self._bars(set(), max_bars=3)
+        assert missed == [
+            dt.datetime(2026, 11, 24, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 11, 24, 4, tzinfo=dt.UTC),
+            dt.datetime(2026, 11, 24, 8, tzinfo=dt.UTC),
+        ]
+
+    def test_stops_at_the_first_analysed_bar(self) -> None:
+        """A completed bar is the boundary; nothing older gets replayed."""
+        missed = self._bars({dt.datetime(2026, 11, 24, 4, tzinfo=dt.UTC)})
+        assert missed == [dt.datetime(2026, 11, 24, 8, tzinfo=dt.UTC)]
+
+    def test_nothing_to_do_when_the_previous_bar_is_done(self) -> None:
+        assert self._bars({dt.datetime(2026, 11, 24, 8, tzinfo=dt.UTC)}) == []
+
+    def test_never_includes_the_current_bar(self) -> None:
+        """The current bar is run separately, and is the only one alerted."""
+        current = dt.datetime(2026, 11, 24, 12, tzinfo=dt.UTC)
+        assert current not in self._bars(set())
+
+    def test_window_bounds_a_long_outage(self) -> None:
+        assert len(self._bars(set(), max_bars=2)) == 2
+
+    def test_disabled_window_replays_nothing(self) -> None:
+        assert self._bars(set(), max_bars=0) == []

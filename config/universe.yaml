@@ -25,9 +25,21 @@ symbols:
     tier: satellite
     notes: "User pick. Lowest-cap name that still clears a usable volume floor."
 
+  # NOT CURRENTLY TRADEABLE BY THIS BOT. Candles come from Binance (see
+  # exchanges/binance.py for why), and GOATUSDT is not listed on Binance at
+  # all - `exchangeInfo?symbol=GOATUSDT` returns "Invalid symbol". So ingest
+  # fails on every timeframe every run, no candles are stored, and the
+  # analysis skips the symbol entirely. It was in this file for days producing
+  # nothing while every run reported success; `tradingbot doctor` now reports
+  # empty coverage as a problem.
+  #
+  # Two ways out: drop it, or add a per-symbol data source so its candles come
+  # from WEEX (which does list it) instead of Binance. The second is the real
+  # fix and is not built yet. Until then this entry is documentation, not a
+  # working symbol.
   - symbol: GOATUSDT
     tier: satellite
-    notes: "User pick. Thin book - expect wide spread and wick risk."
+    notes: "User pick. Thin book - expect wide spread and wick risk. NO BINANCE DATA."
 
   - symbol: DOGEUSDT
     tier: satellite
@@ -40,7 +52,9 @@ symbols:
       Listed ~2026-10-21, so there is not enough history to backtest. Ticker is
       ambiguous across at least three projects, so resolve news/sentiment by
       contract address, never by ticker. Promote to satellite only after
-      min_history_days of stored candles exist.
+      min_history_days of stored candles exist. ALSO NOT ON BINANCE, so like
+      GOATUSDT it currently has no candles and produces nothing - the paper
+      tier was never the thing stopping it.
 
 # Context-only feeds. Never traded, never sized.
 context:

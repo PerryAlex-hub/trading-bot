@@ -22,6 +22,7 @@ from tradingbot.models import (
     Quote,
     Side,
     Tier,
+    Timeframe,
     TradeSetup,
 )
 from tradingbot.risk import (
@@ -31,6 +32,11 @@ from tradingbot.risk import (
     net_risk_reward,
     size_position,
 )
+
+
+def _net_rr_veto(decision) -> bool:
+    """Whether a decision was blocked specifically on net risk:reward."""
+    return any(veto.rule == "per_trade.min_risk_reward" for veto in decision.vetoes)
 
 
 def quote(symbol: str, bid: str, ask: str, mark: str) -> Quote:
@@ -210,8 +216,16 @@ class TestRiskGate:
         assert decision.approved, decision.veto_summary
         assert decision.size is not None
 
-    def test_missing_quote_fails_closed(self, risk_config, btc_spec, btc_long) -> None:
-        """Unknown must never mean permitted."""
+    def test_missing_quote_is_priced_not_vetoed(
+        self, risk_config, btc_spec, btc_long
+    ) -> None:
+        """Unknown friction is charged, not treated as a blocker or as free.
+
+        The old behaviour vetoed on `costs.spread_unknown`, which silenced
+        every symbol whenever the venue ticker was unreachable. Since nothing
+        in this project can place an order, that protected nothing and produced
+        an empty journal instead.
+        """
         decision = RiskGate(risk_config).evaluate(
             btc_long,
             tier=Tier.CORE,
@@ -221,8 +235,35 @@ class TestRiskGate:
             funding=None,
             require_market_data=True,
         )
-        assert not decision.approved
-        assert any(veto.rule == "costs.spread_unknown" for veto in decision.vetoes)
+
+        assert not any(veto.rule == "costs.spread_unknown" for veto in decision.vetoes)
+        assert any("spread unverified" in warning for warning in decision.warnings)
+
+    def test_unknown_spread_is_not_treated_as_free(
+        self, risk_config, btc_spec, btc_long
+    ) -> None:
+        """A missing quote must not produce a better net R:R than a good one.
+
+        This was a real bug: friction used a spread of zero when the quote was
+        missing, so the least-known setup scored best.
+        """
+        gate = RiskGate(risk_config)
+        common = {
+            "tier": Tier.CORE,
+            "portfolio": PortfolioState(equity=Decimal("200")),
+            "spec": btc_spec,
+            "funding": None,
+        }
+        unknown = gate.evaluate(btc_long, quote=None, **common)
+        measured = gate.evaluate(
+            btc_long, quote=quote("BTCUSDT", "91999", "92001", "92000"), **common
+        )
+
+        unknown_rr = _net_rr_veto(unknown)
+        measured_rr = _net_rr_veto(measured)
+        # Either the unknown case is rejected on economics while the measured
+        # one is not, or both pass - never the reverse.
+        assert not (measured_rr and not unknown_rr)
 
     def test_wide_spread_is_vetoed(self, risk_config, btc_spec, btc_long) -> None:
         decision = RiskGate(risk_config).evaluate(
@@ -355,4 +396,69 @@ class TestConfigContradiction:
         ]
         assert "GOATUSDT" in unreachable, (
             "risk.yaml appears to have changed; update this test and the README note"
+        )
+
+
+class TestMinimumSizeOverride:
+    """Small accounts must get an informed ticket, not a dead end.
+
+    Reproduces the deployed DOGEUSDT rejection: 50 USDT equity, a 0.5% budget
+    of 0.25 USDT, and a stop wide enough that the implied position was worth
+    3.23 USDT against a 5 USDT venue floor.
+    """
+
+    def _setup(self) -> TradeSetup:
+        entry = Decimal("0.055330")
+        return TradeSetup(
+            symbol="DOGEUSDT",
+            side=Side.SHORT,
+            entry=entry,
+            stop=entry + Decimal("0.00428348"),
+            targets=(entry - Decimal("0.00856696"),),
+            timeframe=Timeframe.H4,
+        )
+
+    def _size(self, **overrides):
+        kwargs = {
+            "equity": Decimal("50"),
+            "risk_pct": Decimal("0.5"),
+            "tier": Tier.SATELLITE,
+            "spec": None,
+            "max_leverage": 5,
+            "satellite_multiplier": Decimal("1.0"),
+            "fallback_min_notional": Decimal("5.0"),
+            "allow_min_size_override": True,
+            "max_risk_pct_at_min_size": Decimal("2.0"),
+        }
+        kwargs.update(overrides)
+        return size_position(self._setup(), **kwargs)
+
+    def test_raises_to_the_floor_and_discloses_the_real_risk(self) -> None:
+        size = self._size()
+        assert size.viable
+        assert size.at_venue_minimum
+        assert size.notional >= Decimal("5")
+        # Risk is now above the configured budget, and says so rather than
+        # pretending it is still 0.5%.
+        assert size.effective_risk_pct > Decimal("0.5")
+        assert size.risk_amount > Decimal("0.25")
+
+    def test_still_refuses_when_the_floor_costs_too_much(self) -> None:
+        """The ceiling is what makes the override safe rather than reckless."""
+        size = self._size(max_risk_pct_at_min_size=Decimal("0.6"))
+        assert not size.viable
+        assert "ceiling" in size.reason
+
+    def test_disabled_override_keeps_the_old_refusal(self) -> None:
+        size = self._size(allow_min_size_override=False)
+        assert not size.viable
+        assert "below the" in size.reason
+
+    def test_normal_account_is_unaffected(self) -> None:
+        """A funded account sizes from the budget, never from the floor."""
+        size = self._size(equity=Decimal("2000"))
+        assert size.viable
+        assert not size.at_venue_minimum
+        assert size.effective_risk_pct == pytest.approx(
+            Decimal("0.5"), abs=Decimal("0.01")
         )

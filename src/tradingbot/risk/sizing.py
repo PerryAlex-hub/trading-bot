@@ -13,12 +13,17 @@ Leverage does not appear. It changes the *margin* required to hold the
 position, never the amount at risk. Conflating the two is the classic way a
 small account dies: "10x leverage" is not a risk setting.
 
-**Small accounts hit a floor the math does not know about.** `risk.yaml`
-assumes $200 equity at 0.5% risk, which is $1.00 of risk per trade. With a 3x
-ATR stop on a volatile satellite, the resulting position can be worth less than
-the exchange minimum. That is a legitimate, expected outcome and it is reported
-as `PositionSize.unviable` with the arithmetic shown, never silently rounded up
-to something that risks more than the budget.
+**Small accounts hit a floor the math does not know about.** With $50 equity at
+0.5% risk the budget is $0.25, and a 3x ATR stop on a volatile satellite puts
+the implied position at around $3 - below the venue minimum. Refusing outright
+is defensible but produces a bot that emits nothing and therefore learns
+nothing, which is how this module originally behaved.
+
+So when `allow_min_size_override` is set, the position is raised to the venue
+minimum and the REAL risk is reported on the ticket, as long as it stays under
+`max_risk_pct_at_min_size`. Above that it is still refused. The principle is
+informed consent: never silently risk more than budgeted, but do not pretend a
+tradeable setup is untradeable either.
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ def size_position(
     regime_multiplier: Decimal = Decimal("1.0"),
     max_margin_fraction: Decimal = Decimal("0.5"),
     fallback_min_notional: Decimal | None = None,
+    allow_min_size_override: bool = False,
+    max_risk_pct_at_min_size: Decimal = Decimal("2.0"),
 ) -> PositionSize:
     """Size a position from the risk budget, then check it against reality."""
     if equity <= 0:
@@ -55,19 +62,76 @@ def size_position(
         return PositionSize.unviable(setup.symbol, "stop distance is zero")
 
     # --- the risk budget -------------------------------------------------
-    risk_amount = equity * risk_pct / Decimal("100")
+    budget = equity * risk_pct / Decimal("100")
     if tier is Tier.SATELLITE:
-        risk_amount *= satellite_multiplier
-    risk_amount *= regime_multiplier
+        budget *= satellite_multiplier
+    budget *= regime_multiplier
 
-    if risk_amount <= 0:
+    if budget <= 0:
         return PositionSize.unviable(
             setup.symbol,
-            f"risk budget reduced to {risk_amount} by tier/regime multipliers",
+            f"risk budget reduced to {budget} by tier/regime multipliers",
         )
 
-    raw_quantity = risk_amount / risk_per_unit
-    notional = raw_quantity * setup.entry
+    quantity = budget / risk_per_unit
+    if spec is not None:
+        quantity = spec.round_quantity(quantity)
+        if quantity <= 0 and not allow_min_size_override:
+            return PositionSize.unviable(
+                setup.symbol,
+                f"risk budget {budget:.4f} USDT buys "
+                f"{(budget / risk_per_unit):.10f} units, which rounds to zero at "
+                f"the venue step of {spec.size_step}. Either equity is too small "
+                f"or the {risk_per_unit} stop distance is too wide.",
+            )
+
+    notional = quantity * setup.entry
+    at_minimum = False
+
+    # --- venue minimum ---------------------------------------------------
+    # Whichever floor applies: the exchange-reported one, or the configured
+    # fallback when WEEX could not be reached. The fallback is clearly labelled
+    # as an assumption wherever it is reported.
+    minimum, minimum_source = _binding_minimum(spec, setup, fallback_min_notional)
+
+    if minimum is not None and notional < minimum:
+        required_quantity = minimum / setup.entry
+        if spec is not None:
+            required_quantity = spec.round_quantity_up(required_quantity)
+
+        risk_at_minimum = required_quantity * risk_per_unit
+        risk_pct_at_minimum = risk_at_minimum / equity * Decimal("100")
+
+        if not allow_min_size_override:
+            needed_equity = risk_at_minimum / (risk_pct / Decimal("100"))
+            return PositionSize.unviable(
+                setup.symbol,
+                f"position value {notional:.4f} USDT is below the {minimum_source} "
+                f"{minimum:.4f}. Clearing it would risk {risk_at_minimum:.4f} USDT "
+                f"instead of the budgeted {budget:.4f} "
+                f"({_ratio(risk_at_minimum, budget)} over budget). This trade "
+                f"needs about {needed_equity:.0f} USDT of equity at {risk_pct}% risk.",
+            )
+
+        if risk_pct_at_minimum > max_risk_pct_at_min_size:
+            return PositionSize.unviable(
+                setup.symbol,
+                f"the smallest tradeable position ({minimum:.4f} USDT, the "
+                f"{minimum_source}) would risk {risk_at_minimum:.4f} USDT, which is "
+                f"{risk_pct_at_minimum:.2f}% of {equity} equity and above the "
+                f"{max_risk_pct_at_min_size}% ceiling for minimum-size trades. "
+                f"The {risk_per_unit} stop is too wide for this account size.",
+            )
+
+        quantity = required_quantity
+        notional = quantity * setup.entry
+        budget = risk_at_minimum
+        at_minimum = True
+
+    if quantity <= 0:
+        return PositionSize.unviable(
+            setup.symbol, "sizing resolved to zero units after venue rounding"
+        )
 
     # --- leverage --------------------------------------------------------
     # Only as much leverage as the position actually requires, capped. Using
@@ -77,53 +141,9 @@ def size_position(
     if spec is not None and spec.max_leverage is not None:
         leverage_cap = min(leverage_cap, Decimal(spec.max_leverage))
 
-    required = notional / equity if equity > 0 else leverage_cap
-    leverage = max(Decimal("1"), min(leverage_cap, _ceil_decimal(required)))
+    required_leverage = notional / equity
+    leverage = max(Decimal("1"), min(leverage_cap, _ceil_decimal(required_leverage)))
     margin = notional / leverage
-
-    # --- venue constraints -----------------------------------------------
-    quantity = raw_quantity
-    if spec is not None:
-        quantity = spec.round_quantity(raw_quantity)
-        if quantity <= 0:
-            step = spec.size_step
-            return PositionSize.unviable(
-                setup.symbol,
-                f"risk budget {risk_amount:.4f} USDT buys {raw_quantity:.10f} units, "
-                f"which rounds to zero at the venue step of {step}. "
-                f"Either equity is too small or the {risk_per_unit} stop distance is too wide.",
-            )
-
-        notional = quantity * setup.entry
-        margin = notional / leverage
-
-        minimum = spec.effective_min_notional(setup.entry)
-        if minimum is not None and notional < minimum:
-            shortfall_risk = minimum / setup.entry * risk_per_unit
-            needed_equity = shortfall_risk / (risk_pct / Decimal("100"))
-            return PositionSize.unviable(
-                setup.symbol,
-                f"position value {notional:.4f} USDT is below the venue minimum "
-                f"{minimum:.4f}. Clearing it would risk {shortfall_risk:.4f} USDT "
-                f"instead of the budgeted {risk_amount:.4f} "
-                f"({(shortfall_risk/risk_amount):.1f}x over budget). "
-                f"This trade needs about {needed_equity:.0f} USDT of equity at "
-                f"{risk_pct}% risk.",
-            )
-
-    # --- floor when the venue spec is unavailable ------------------------
-    # A missing spec is normal: WEEX may be unreachable or its cache empty. But
-    # with no spec there is no minimum to check, and sizing would otherwise
-    # report a $0.80 position as viable. Observed on a real DOGEUSDT signal.
-    if spec is None and fallback_min_notional is not None and notional < fallback_min_notional:
-        return PositionSize.unviable(
-            setup.symbol,
-            f"position value {notional:.4f} USDT is below the assumed venue "
-            f"minimum {fallback_min_notional} (no live contract spec available, "
-            f"so this is a configured floor, not an exchange-reported one). "
-            f"Risk budget {risk_amount:.4f} USDT over a {risk_per_unit} stop "
-            "cannot buy a tradeable position.",
-        )
 
     # --- margin sanity ---------------------------------------------------
     # A single trade must not consume the account even when its risk is small:
@@ -137,20 +157,59 @@ def size_position(
             "position is too large to hold safely alongside another.",
         )
 
+    effective_risk_pct = budget / equity * Decimal("100")
+    if at_minimum:
+        reason = (
+            f"raised to the {minimum_source} of {minimum:.4f} USDT: "
+            f"{quantity} units risking {budget:.4f} USDT "
+            f"({effective_risk_pct:.2f}% of equity, above the configured "
+            f"{risk_pct}%) at {leverage}x, margin {margin:.4f}"
+        )
+    else:
+        reason = (
+            f"risking {budget:.4f} USDT over a {risk_per_unit} stop = "
+            f"{quantity} units ({notional:.4f} USDT at {leverage}x, "
+            f"margin {margin:.4f})"
+        )
+
     return PositionSize(
         symbol=setup.symbol,
         quantity=quantity,
         notional=notional,
         margin=margin,
         leverage=leverage,
-        risk_amount=risk_amount,
+        risk_amount=budget,
         viable=True,
-        reason=(
-            f"risking {risk_amount:.4f} USDT over a {risk_per_unit} stop = "
-            f"{quantity} units ({notional:.4f} USDT at {leverage}x, "
-            f"margin {margin:.4f})"
-        ),
+        reason=reason,
+        at_venue_minimum=at_minimum,
+        effective_risk_pct=effective_risk_pct,
     )
+
+
+def _binding_minimum(
+    spec: ContractSpec | None,
+    setup: TradeSetup,
+    fallback_min_notional: Decimal | None,
+) -> tuple[Decimal | None, str]:
+    """The minimum position value that actually applies, and where it came from.
+
+    A missing spec is normal - WEEX may be unreachable or its cache empty - but
+    with no floor at all, sizing would report a $0.80 position as viable, which
+    no exchange would accept. Observed on a real DOGEUSDT signal.
+    """
+    if spec is not None:
+        reported = spec.effective_min_notional(setup.entry)
+        if reported is not None:
+            return reported, "venue minimum"
+    if fallback_min_notional is not None:
+        return fallback_min_notional, "assumed venue minimum (no live contract spec)"
+    return None, ""
+
+
+def _ratio(actual: Decimal, budgeted: Decimal) -> str:
+    if budgeted <= 0:
+        return "an unbounded multiple"
+    return f"{(actual / budgeted):.1f}x"
 
 
 def friction_cost(

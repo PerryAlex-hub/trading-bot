@@ -24,18 +24,29 @@
 # Schedules are intentionally offset a few minutes past the bar close: the
 # analysis uses the most recently CLOSED bar, and firing exactly on the
 # boundary risks racing the exchange's own candle finalisation.
+#
+# WHY THE MONITOR LIVES IN ITS OWN FILE NOW. This workflow originally carried
+# both crons, which put them in one concurrency group. Measured over the first
+# 37 hours of deployment: 7 scheduled runs arrived out of roughly 46 expected,
+# alternating perfectly analyse/monitor/analyse/monitor with 25-65 minute
+# delays. Analysis ran 3 times instead of 9, so two thirds of 4h bars were
+# never looked at. Two schedules contending for one group is the likeliest
+# cause, and separating them is free. GitHub also drops scheduled triggers on
+# its own under load, so see the note in monitor.yml about not trusting cron
+# for timing.
 
-name: trade
+name: analyse
 
 on:
   schedule:
-    # Analysis, on 4h bar closes (00:00/04:00/08:00/12:00/16:00/20:00 UTC).
-    # GitHub can delay a scheduled run by 5-15 minutes under load; that is
-    # harmless here because the job derives its own bar time and refuses to
-    # re-analyse a bar it has already done.
+    # 4h bar closes (00:00/04:00/08:00/12:00/16:00/20:00 UTC).
+    # A delayed or dropped trigger is now survivable: `analyse` catches up on
+    # the last 6 bars that have no successful run, analysing each with only the
+    # data available at that bar, before analysing the current one. Backfilled
+    # bars are journalled silently - only the current bar is alerted and only
+    # it opens a paper position. So the schedule below sets the cadence, not
+    # the coverage, and one surviving run per 24h still fills the journal.
     - cron: "7 0,4,8,12,16,20 * * *"
-    # Position monitor, hourly. Cheap: exits in seconds when nothing is open.
-    - cron: "37 * * * *"
   workflow_dispatch:
     inputs:
       job:
@@ -54,7 +65,7 @@ on:
 # while the first is mid-execution could double-submit; the client_order_id
 # guard would catch it, but not racing in the first place is better.
 concurrency:
-  group: trade-${{ github.ref }}
+  group: analyse-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -146,16 +157,14 @@ jobs:
             echo "::warning::Market data host returned HTTP ${CODE}; ingest will likely fail."
           fi
 
-      # Decide which job this invocation is. A scheduled run carries the cron
-      # expression that triggered it, which is how one workflow serves two
-      # different schedules.
+      # A scheduled run is always the analysis. Manual runs can pick any job,
+      # which is what makes `doctor` and `refresh-specs` reachable without a
+      # local checkout.
       - name: Select job
         id: select
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "job=${{ inputs.job }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "37 * * * *" ]; then
-            echo "job=monitor" >> "$GITHUB_OUTPUT"
           else
             echo "job=analyse" >> "$GITHUB_OUTPUT"
           fi

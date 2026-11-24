@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from enum import Enum
 from typing import Any
 
@@ -128,6 +128,23 @@ class ContractSpec:
         if step is None or step <= 0:
             return quantity
         return (quantity // step) * step
+
+    def round_quantity_up(self, quantity: Decimal) -> Decimal:
+        """Snap a quantity UP to the venue step.
+
+        The deliberate exception to `round_quantity`. Used only when clearing a
+        venue minimum, where rounding down would land back under the floor and
+        the order would simply be rejected. The extra risk this creates is
+        disclosed on the ticket rather than absorbed silently.
+        """
+        step = self.size_step
+        if step is None or step <= 0:
+            return quantity
+        steps = quantity / step
+        whole = steps.quantize(Decimal("1"), rounding=ROUND_DOWN)
+        if whole < steps:
+            whole += 1
+        return whole * step
 
     def round_price(self, price: Decimal) -> Decimal:
         step = self.price_step
@@ -287,6 +304,13 @@ class PositionSize:
     risk_amount: Decimal
     viable: bool = True
     reason: str = ""
+    # True when the risk budget could not buy a tradeable position and the size
+    # was raised to the venue minimum instead. The ticket must say so: the
+    # trade then risks more than the configured per-trade budget.
+    at_venue_minimum: bool = False
+    # What the position actually risks, as a % of equity. Equal to the
+    # configured risk_pct in the normal case, higher when at_venue_minimum.
+    effective_risk_pct: Decimal | None = None
 
     @classmethod
     def unviable(cls, symbol: str, reason: str) -> PositionSize:

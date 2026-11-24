@@ -9,7 +9,7 @@ drift from what production runs.
     tradingbot ingest               sync candles from Binance
     tradingbot analyse              run one analysis cycle
     tradingbot monitor              reconcile positions, check breakers
-    tradingbot verify-credentials   prove WEEX signing works (required for live)
+    tradingbot refresh-specs        reload WEEX contract minimums
     tradingbot status               account, positions, recent signals
     tradingbot journal              recent signals with their reasons
     tradingbot doctor               check the deployment is wired up correctly
@@ -106,9 +106,17 @@ def analyse(
     force: bool = typer.Option(False, "--force", help="Re-run an already-analysed bar"),
     no_notify: bool = typer.Option(False, "--no-notify"),
     skip_ingest: bool = typer.Option(False, "--skip-ingest"),
+    backfill: int = typer.Option(
+        6,
+        "--backfill",
+        help=(
+            "How many recent bars to catch up on if their scheduled run never "
+            "fired. 0 disables catch-up and analyses only the current bar."
+        ),
+    ),
 ) -> None:
-    """Run one full analysis cycle."""
-    from .jobs.analyze import run_cycle
+    """Run one full analysis cycle, catching up on any missed bars first."""
+    from .jobs.analyze import run_catch_up, run_cycle
     from .jobs.ingest import ingest_candles
 
     settings = get_settings()
@@ -117,14 +125,56 @@ def analyse(
         "orders: never (this project has no execution capability)"
     )
 
+    # Ingest failures used to be discarded here. A symbol that is not listed on
+    # the data venue fails on every timeframe, every run, and the only trace
+    # was a log line nobody reads - so the universe silently shrank and the
+    # run summary still said everything was fine. They are now carried into the
+    # cycle, which puts them in the Telegram summary.
+    ingest_errors: list[str] = []
     if not skip_ingest:
-        ingest_candles()
+        ingest = ingest_candles()
+        ingest_errors = [
+            f"ingest {symbol} {timeframe}: {error}"
+            for symbol, timeframe, error in ingest.failures
+        ]
+        if ingest_errors:
+            console.print(
+                f"[red]Ingest had {len(ingest.failures)} failure(s)[/red] "
+                f"across {len(set(f[0] for f in ingest.failures))} symbol(s)"
+            )
+            for line in ingest_errors[:8]:
+                console.print(f"  [red]{line}[/red]")
 
-    result = run_cycle(settings=settings, trigger="manual", force=force, notify=not no_notify)
+    if backfill <= 0:
+        result = run_cycle(
+            settings=settings,
+            trigger="manual",
+            force=force,
+            notify=not no_notify,
+            extra_errors=ingest_errors,
+        )
+        _report_cycle(result)
+        return
+
+    catch_up = run_catch_up(
+        settings=settings,
+        max_bars=backfill,
+        notify=not no_notify,
+        force=force,
+        extra_errors=ingest_errors,
+    )
+    if catch_up.backfilled:
+        console.print(f"[yellow]Catch-up:[/yellow] {catch_up.describe()}")
+        for cycle in catch_up.backfilled:
+            console.print(f"  [dim]{cycle.bar_time:%Y-%m-%d %H:%M}[/dim] {cycle.describe()}")
+    if catch_up.current is not None:
+        _report_cycle(catch_up.current)
+
+
+def _report_cycle(result) -> None:
     if result.skipped_reason:
         console.print(f"[yellow]{result.skipped_reason}[/yellow]")
         return
-
     console.print(f"[green]Cycle:[/green] {result.describe()}")
     for error in result.errors:
         console.print(f"  [red]error[/red]: {error}")
@@ -160,6 +210,114 @@ def refresh_specs() -> None:
 # ---------------------------------------------------------------------------
 # Safety
 # ---------------------------------------------------------------------------
+
+
+@app.command()
+def minimums(
+    max_usdt: float = typer.Option(
+        2.0, "--max-usdt", help="Only list contracts cheaper than this to open"
+    ),
+    limit: int = typer.Option(25, "--limit", help="How many to list"),
+    leverage: int = typer.Option(10, "--leverage", help="Leverage for the margin column"),
+) -> None:
+    """Rank WEEX contracts by the smallest position you can open.
+
+    Answers "which coin can I test live with for cents" with data instead of
+    guesswork. WEEX publishes its minimum in the BASE asset, so the cost in
+    USDT is `min_order_size x price`: BTC's 0.0001 minimum is ~6 USDT only
+    because BTC is expensive, while a sub-cent token with a minimum of 1 unit
+    costs a fraction of a cent. There is no venue-wide USDT floor to escape.
+
+    Needs no database and no credentials - the market endpoints are public.
+    """
+    from .config import load_universe
+    from .exchanges.weex_market import WeexMarketData
+
+    try:
+        with WeexMarketData() as client:
+            specs = client.contract_specs(use_cache=False)
+            marks = client.all_marks()
+    except Exception as exc:
+        console.print(f"[red]Could not reach WEEX:[/red] {exc}")
+        console.print(
+            "\nThe market endpoints are public, so this is a network or a "
+            "moved-path problem rather than an auth one. Check "
+            "exchanges/weex_market.py TICKER_PATHS against the current docs."
+        )
+        raise typer.Exit(code=1) from exc
+
+    if not marks:
+        console.print(
+            "[yellow]Contract specs loaded but no prices came back[/yellow], so "
+            "minimums cannot be converted to USDT. The ticker path has probably "
+            "moved; the spec list is fine."
+        )
+        raise typer.Exit(code=1)
+
+    rows: list[tuple[Decimal, str, Decimal, Decimal]] = []
+    for symbol, spec in specs.items():
+        mark = marks.get(symbol)
+        if mark is None or spec.min_order_size is None:
+            continue
+        notional = spec.effective_min_notional(mark)
+        if notional is None:
+            continue
+        rows.append((notional, symbol, spec.min_order_size, mark))
+    rows.sort(key=lambda row: row[0])
+
+    universe_symbols = {
+        config.symbol for config in load_universe().symbols
+    }
+
+    table = Table(title=f"Smallest openable position (of {len(rows)} contracts priced)")
+    table.add_column("Symbol")
+    table.add_column("Min size", justify="right")
+    table.add_column("Price", justify="right")
+    table.add_column("Min order (USDT)", justify="right")
+    table.add_column(f"Margin @{leverage}x", justify="right")
+
+    shown = 0
+    for notional, symbol, min_size, mark in rows:
+        if notional > Decimal(str(max_usdt)):
+            break
+        if shown >= limit:
+            break
+        margin = notional / Decimal(leverage)
+        table.add_row(
+            f"{symbol}{' *' if symbol in universe_symbols else ''}",
+            f"{min_size.normalize():f}",
+            f"{mark.normalize():f}",
+            f"{notional:.4f}",
+            f"{margin:.4f}",
+        )
+        shown += 1
+
+    console.print(table)
+    if shown == 0:
+        console.print(
+            f"[yellow]Nothing under {max_usdt} USDT.[/yellow] The cheapest is "
+            f"{rows[0][1]} at {rows[0][0]:.4f} USDT."
+        )
+    console.print("[dim]* already in universe.yaml[/dim]")
+
+    # The symbols actually configured, whether or not they are cheap, because
+    # this is the number risk.yaml's fallback_min_notional_usdt is guessing at.
+    console.print("\n[bold]Your universe[/bold]")
+    for symbol in sorted(universe_symbols):
+        spec = specs.get(symbol)
+        mark = marks.get(symbol)
+        if spec is None:
+            console.print(f"  {symbol:<10} [red]not listed on WEEX futures[/red]")
+            continue
+        if mark is None or spec.min_order_size is None:
+            console.print(f"  {symbol:<10} [yellow]no price or no minimum reported[/yellow]")
+            continue
+        notional = spec.effective_min_notional(mark) or Decimal("0")
+        console.print(
+            f"  {symbol:<10} min {spec.min_order_size.normalize():f} "
+            f"= {notional:.4f} USDT, margin {notional / Decimal(leverage):.4f} "
+            f"at {leverage}x"
+        )
 
 
 @app.command("clear-breaker")
@@ -548,6 +706,102 @@ def doctor() -> None:
             console.print(
                 f"  bot commands     {len(settings.allowed_chat_ids())} authorised chat(s)"
             )
+
+    # --- data coverage ----------------------------------------------------
+    # The check that would have caught the real failure on day one: a symbol
+    # that the data venue does not list ingests nothing, is skipped by the
+    # analysis with an INFO log, and never appears in any output again. Two of
+    # six symbols were in that state for days while every run reported success.
+    console.print("\n[bold]Data coverage[/bold]")
+    try:
+        from .config import load_universe
+        from .db.engine import session_scope
+        from .db.repo import CandleRepo
+
+        universe = load_universe()
+        primary = universe.primary_timeframe
+        empty: list[str] = []
+        with session_scope() as session:
+            repo = CandleRepo(session)
+            for symbol in universe.symbols_requiring_data():
+                count = repo.count(symbol, primary)
+                days = repo.history_days(symbol, primary)
+                if count == 0:
+                    empty.append(symbol)
+                    console.print(f"  {symbol:<10} [red]no {primary} candles[/red]")
+                else:
+                    console.print(
+                        f"  {symbol:<10} {count} {primary} bars, {days:.0f} days"
+                    )
+        if empty:
+            problems.append(
+                f"no candles stored for {', '.join(empty)}. These symbols cannot "
+                "produce a signal: the analysis skips any symbol with no primary "
+                "timeframe data. Either they are not listed on the data venue "
+                "(check with `tradingbot ingest`) or ingest has never succeeded "
+                "for them. Remove them from universe.yaml or source their "
+                "candles elsewhere."
+            )
+    except Exception as exc:
+        warnings.append(f"data coverage check could not run: {exc}")
+
+    # --- venues -----------------------------------------------------------
+    # The failure this exists to diagnose: every signal on the first deployment
+    # was rejected with `costs.spread_unknown` because no WEEX quote came back,
+    # and nothing in the output said whether the venue was unreachable, the
+    # endpoint path had moved, or the symbol was simply not listed. Those need
+    # three different fixes, so guessing is expensive.
+    console.print("\n[bold]Venues[/bold]")
+    try:
+        from .config import load_universe
+        from .exchanges.weex_market import WeexMarketData
+
+        probe_symbol = next(
+            (c.symbol for c in load_universe().symbols if c.tier.tradeable),
+            "BTCUSDT",
+        )
+        with WeexMarketData() as client:
+            try:
+                specs = client.contract_specs(use_cache=False)
+                console.print(
+                    f"  weex specs       [green]ok[/green] ({len(specs)} contracts)"
+                )
+                missing = [
+                    c.symbol
+                    for c in load_universe().symbols
+                    if c.symbol.upper() not in specs
+                ]
+                if missing:
+                    warnings.append(
+                        f"not listed on WEEX contracts: {', '.join(missing)}. "
+                        "Sizing falls back to the configured minimum for these, "
+                        "so their tickets use an assumed floor."
+                    )
+            except Exception as exc:
+                warnings.append(
+                    f"WEEX contract info unavailable ({str(exc)[:120]}). Sizing "
+                    "uses venue.fallback_min_notional_usdt instead of real "
+                    "minimums. Run `tradingbot refresh-specs` once it is back."
+                )
+                console.print("  weex specs       [yellow]unavailable[/yellow]")
+
+            quote = client.quote(probe_symbol)
+            if quote is None:
+                warnings.append(
+                    f"no WEEX quote for {probe_symbol}, so spreads cannot be "
+                    "verified and friction is charged at the assumed rate in "
+                    "costs.assumed_spread_pct. Signals still issue. If this "
+                    "persists, the ticker path in exchanges/weex_market.py may "
+                    "have moved, or the host may be blocked from this network."
+                )
+                console.print(f"  weex quote       [yellow]none for {probe_symbol}[/yellow]")
+            else:
+                console.print(
+                    f"  weex quote       [green]ok[/green] ({probe_symbol} "
+                    f"spread {quote.spread_pct:.4f}%)"
+                )
+    except Exception as exc:
+        warnings.append(f"venue probe could not run: {exc}")
 
     # --- verdict ----------------------------------------------------------
     console.print()

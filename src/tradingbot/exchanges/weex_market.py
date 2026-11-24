@@ -28,22 +28,30 @@ from .weex import WeexClient, WeexEndpointError, _first, _to_decimal, _unwrap
 
 log = logging.getLogger(__name__)
 
+# Paths from WEEX's published futures REST documentation. The `/capi/` entries
+# are retained as fallbacks but are known to 404: they came from search results
+# rather than the docs, which is why every deployed run could not fetch a quote.
 TICKER_PATHS = (
+    "/api/swap/v3/market/ticker",
     "/capi/v3/market/ticker",
-    "/capi/v2/market/ticker",
+)
+ALL_TICKERS_PATHS = (
+    "/api/swap/v3/market/tickers",
     "/capi/v3/market/tickers",
 )
-DEPTH_PATHS = ("/capi/v3/market/depth", "/capi/v2/market/depth")
+DEPTH_PATHS = ("/api/swap/v3/market/depth", "/capi/v3/market/depth")
 FUNDING_PATHS = (
+    "/api/swap/v3/market/funding_time",
+    "/api/swap/v3/market/funding-rate",
     "/capi/v3/market/funding-rate",
-    "/capi/v3/market/fundingRate",
-    "/capi/v2/market/funding-rate",
 )
 
-_BID_KEYS = ("bestBid", "bid", "buyPrice", "bid1", "bidPx", "best_bid")
-_ASK_KEYS = ("bestAsk", "ask", "sellPrice", "ask1", "askPx", "best_ask")
-_MARK_KEYS = ("markPrice", "mark", "last", "lastPrice", "close", "indexPrice")
-_FUNDING_KEYS = ("fundingRate", "funding_rate", "rate", "currentFundingRate")
+# Documented ticker fields are snake_case: best_bid, best_ask, last. The
+# camelCase variants are kept because third-party SDKs report them.
+_BID_KEYS = ("best_bid", "bestBid", "bid", "buyPrice", "bidPx")
+_ASK_KEYS = ("best_ask", "bestAsk", "ask", "sellPrice", "askPx")
+_MARK_KEYS = ("last", "markPrice", "mark", "lastPrice", "close", "indexPrice")
+_FUNDING_KEYS = ("funding_rate", "fundingRate", "rate", "currentFundingRate")
 
 
 @dataclass
@@ -137,6 +145,33 @@ class WeexMarketData(WeexClient):
             mark=mark or (bid + ask) / 2,
             at=datetime.now(tz=UTC),
         )
+
+    def all_marks(self) -> dict[str, Decimal]:
+        """Mark price for every contract, in one request.
+
+        Exists so minimum order values can be ranked across the whole venue
+        without one request per symbol. The minimum order size WEEX publishes
+        is denominated in the BASE asset, so its cost in USDT is
+        `min_order_size x price` - which means the cheapest contract to test
+        with is a question about price, and cannot be answered from the spec
+        list alone.
+        """
+        try:
+            _path, payload = self._try_paths(ALL_TICKERS_PATHS)
+        except WeexEndpointError as exc:
+            log.warning("No WEEX all-tickers endpoint responded: %s", exc)
+            return {}
+
+        marks: dict[str, Decimal] = {}
+        for entry in _unwrap(payload):
+            raw = _first(entry, ("symbol", "contract_code", "contractCode"))
+            if raw is None:
+                continue
+            mark = _to_decimal(_first(entry, _MARK_KEYS))
+            if mark is None or mark <= 0:
+                continue
+            marks[str(raw).upper().replace("-", "").replace("_", "")] = mark
+        return marks
 
     def funding(self, symbol: str) -> FundingInfo | None:
         """Current funding rate, normalised to a percentage per 8h.

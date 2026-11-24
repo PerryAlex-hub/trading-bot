@@ -154,6 +154,23 @@ class RiskConfig:
         key = "satellite_max_effective" if tier is Tier.SATELLITE else "max_effective"
         return int(self.get("leverage", key, default=self.get("leverage", "max_effective", default=10)))
 
+    def assumed_spread_pct(self, tier: Tier) -> Decimal:
+        """Spread to assume when the venue quote could not be fetched.
+
+        Pessimistic by design. The alternative, used before this existed, was a
+        spread of zero whenever the quote was missing - which flattered net R:R
+        precisely when the least was known about the book.
+        """
+        table = self.get("costs", "assumed_spread_pct", default=None)
+        if table is None:
+            return Decimal("0.25")
+        if not isinstance(table, dict):
+            return Decimal(str(table))
+        for key in (tier.value, "default"):
+            if key in table:
+                return Decimal(str(table[key]))
+        return Decimal("0.25")
+
     def beta_to_btc(self, symbol: str) -> Decimal:
         table = self.get("portfolio", "beta_to_btc", default={}) or {}
         if symbol in table:

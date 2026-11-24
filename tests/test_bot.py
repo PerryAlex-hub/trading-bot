@@ -11,6 +11,8 @@ of chat ids.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from tradingbot.notify.bot import BotCommand, TelegramBot, _num
 from tradingbot.settings import Settings
 
@@ -364,3 +366,58 @@ class TestWebhookEndpoint:
         payload = self._client().get("/health").json()
         assert payload["live_orders_enabled"] is False
         assert payload["trading_mode"] in {"signal_only", "paper"}
+
+
+class TestAllMarks:
+    """Mark prices for every contract in one request.
+
+    Minimum order sizes are published in the base asset, so converting them to
+    USDT needs a price per symbol. Fetching them one at a time would be ~200
+    requests to answer one question.
+    """
+
+    def _client(self, payload):
+        from tradingbot.exchanges.weex_market import WeexMarketData
+
+        client = WeexMarketData()
+        client._try_paths = lambda paths, params=None: ("/stub", payload)  # type: ignore[method-assign]
+        return client
+
+    def test_parses_a_list_of_tickers(self) -> None:
+        client = self._client(
+            {
+                "data": [
+                    {"symbol": "BTC-USDT", "last": "60737.12"},
+                    {"symbol": "DOGEUSDT", "markPrice": "0.05533"},
+                ]
+            }
+        )
+        marks = client.all_marks()
+        # Symbols are normalised, so the hyphenated form still matches config.
+        assert marks["BTCUSDT"] == Decimal("60737.12")
+        assert marks["DOGEUSDT"] == Decimal("0.05533")
+
+    def test_skips_rows_without_a_usable_price(self) -> None:
+        client = self._client(
+            {
+                "data": [
+                    {"symbol": "AAAUSDT", "last": "0"},
+                    {"symbol": "BBBUSDT"},
+                    {"last": "12"},
+                    {"symbol": "CCCUSDT", "last": "1.5"},
+                ]
+            }
+        )
+        assert client.all_marks() == {"CCCUSDT": Decimal("1.5")}
+
+    def test_an_unreachable_endpoint_returns_empty_not_an_exception(self) -> None:
+        from tradingbot.exchanges.weex import WeexEndpointError
+        from tradingbot.exchanges.weex_market import WeexMarketData
+
+        client = WeexMarketData()
+
+        def boom(paths, params=None):
+            raise WeexEndpointError("all paths failed")
+
+        client._try_paths = boom  # type: ignore[method-assign]
+        assert client.all_marks() == {}
