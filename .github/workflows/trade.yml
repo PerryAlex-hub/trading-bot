@@ -46,15 +46,37 @@ on:
     # bars are journalled silently - only the current bar is alerted and only
     # it opens a paper position. So the schedule below sets the cadence, not
     # the coverage, and one surviving run per 24h still fills the journal.
-    # Minute 23, not 7. GitHub queues scheduled workflows and drops them under
-    # load, and the first ten minutes of each hour are the most contended slot
-    # on the platform - an enormous number of crons are written on the hour.
-    # Measured on 2026-11-25 at minute 7: two of five expected analyse runs
-    # arrived, a 40% delivery rate, and the hourly monitor at minute 37 managed
-    # 14%. Moving off the busy minute is a mitigation with no downside; it is
-    # NOT a fix, and the external-trigger note in monitor.yml remains the real
-    # answer if delivery still disappoints.
+    # THREE ATTEMPTS AT THE SAME BAR, not one. This is the central trick in
+    # this file, so it is worth understanding before changing any line below.
+    #
+    # GitHub queues scheduled workflows and silently drops them under load.
+    # Measured on 2026-11-25: two of five expected analyse runs arrived, a 40%
+    # delivery rate, and the last run had been eight hours earlier on a
+    # schedule that promises four. No cron expression fixes that.
+    #
+    # But a duplicate run is free here. `run_cycle` checks RunRepo.already_ran
+    # for the bar and returns BEFORE the Telegram notifier is even constructed,
+    # so a second or third attempt at a bar that is already done costs about a
+    # minute of Actions time and sends nothing. Actions minutes are unlimited
+    # on a public repository. So instead of one trigger that lands 40% of the
+    # time, there are three independent ones: if each lands 40%, at least one
+    # lands about 78% of the time, and the first to arrive does the work.
+    #
+    # All three target the SAME closed bar. A 4h bar with open_time 20:00
+    # closes at 00:00, so a run at 00:23, 00:53 or 01:13 all see 20:00 as the
+    # most recently closed bar - the window is 70 minutes wide and every
+    # attempt in it is equivalent.
+    #
+    # Minute 23/53/13 rather than 7: the first ten minutes of an hour are the
+    # most contended slot on the platform, because an enormous number of crons
+    # are written on the hour.
+    #
+    # This is still a mitigation. The real fix is an external clock - see
+    # docs/SCHEDULING.md - because three unreliable triggers are better odds,
+    # not a guarantee.
     - cron: "23 0,4,8,12,16,20 * * *"
+    - cron: "53 0,4,8,12,16,20 * * *"
+    - cron: "13 1,5,9,13,17,21 * * *"
   workflow_dispatch:
     inputs:
       job:

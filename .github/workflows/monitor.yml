@@ -41,7 +41,11 @@ on:
     # 4h candles, so the monitor cannot detect an exit sooner than the candle
     # that contains it, and the analyse job backfills any bar whose trigger
     # never came.
+    # Two attempts per two-hour window, for the same reason analyse has three:
+    # a monitor run with nothing to resolve exits in seconds, so a duplicate
+    # costs almost nothing and doubles the chance one arrives.
     - cron: "41 */2 * * *"
+    - cron: "11 1-23/2 * * *"
   workflow_dispatch:
 
 concurrency:
