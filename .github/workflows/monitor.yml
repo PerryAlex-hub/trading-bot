@@ -31,7 +31,17 @@ name: monitor
 
 on:
   schedule:
-    - cron: "37 * * * *"
+    # Every two hours at minute 41, down from hourly at 37. Hourly was
+    # delivering 3 runs in 24 hours - about 14% - so it was already behaving
+    # like a two-hourly schedule, just unpredictably. Asking for less, off the
+    # contended top of the hour, trades a nominal cadence nobody was getting
+    # for one that might actually arrive.
+    #
+    # Nothing is lost by checking less often: positions resolve against stored
+    # 4h candles, so the monitor cannot detect an exit sooner than the candle
+    # that contains it, and the analyse job backfills any bar whose trigger
+    # never came.
+    - cron: "41 */2 * * *"
   workflow_dispatch:
 
 concurrency:

@@ -46,7 +46,15 @@ on:
     # bars are journalled silently - only the current bar is alerted and only
     # it opens a paper position. So the schedule below sets the cadence, not
     # the coverage, and one surviving run per 24h still fills the journal.
-    - cron: "7 0,4,8,12,16,20 * * *"
+    # Minute 23, not 7. GitHub queues scheduled workflows and drops them under
+    # load, and the first ten minutes of each hour are the most contended slot
+    # on the platform - an enormous number of crons are written on the hour.
+    # Measured on 2026-11-25 at minute 7: two of five expected analyse runs
+    # arrived, a 40% delivery rate, and the hourly monitor at minute 37 managed
+    # 14%. Moving off the busy minute is a mitigation with no downside; it is
+    # NOT a fix, and the external-trigger note in monitor.yml remains the real
+    # answer if delivery still disappoints.
+    - cron: "23 0,4,8,12,16,20 * * *"
   workflow_dispatch:
     inputs:
       job:
