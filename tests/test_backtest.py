@@ -216,3 +216,137 @@ class TestMetrics:
         assert "expectancy_r" in stats
         # One +~1.9R win against one -~1.1R loss is net positive at a 50% rate.
         assert isinstance(stats["expectancy_r"], float)
+
+
+class TestBootstrapInference:
+    """Whether an expectancy figure is distinguishable from luck.
+
+    A single expectancy number is the most dangerous output this project
+    produces: "+0.14R per trade" reads identically over 15 trades and 1,500,
+    and the first is almost certainly noise.
+    """
+
+    def _r(self, wins: int, losses: int, win_r="2.4", loss_r="-1.1") -> list[Decimal]:
+        return [Decimal(win_r)] * wins + [Decimal(loss_r)] * losses
+
+    def test_too_few_trades_returns_nothing_rather_than_a_number(self) -> None:
+        """Refusing to quote an interval is more honest than quoting a useless one."""
+        from tradingbot.backtest.engine import (
+            MIN_TRADES_FOR_INFERENCE,
+            bootstrap_expectancy,
+        )
+
+        assert bootstrap_expectancy(self._r(3, 5)) is None
+        assert len(self._r(3, 5)) < MIN_TRADES_FOR_INFERENCE
+
+    def test_a_marginal_edge_straddles_zero(self) -> None:
+        """The case that matters: a positive mean that means nothing.
+
+        Ten wins against twenty losses at a 1:2.2 payoff averages a little
+        above zero, and an interval spanning zero is the correct reading.
+        """
+        from tradingbot.backtest.engine import bootstrap_expectancy
+
+        stats = bootstrap_expectancy(self._r(10, 20))
+        assert stats is not None
+        assert stats["expectancy_r"] > 0          # looks like an edge
+        assert stats["straddles_zero"] is True    # is not one
+        assert 0.3 < stats["prob_positive"] < 0.8
+
+    def test_a_strong_edge_does_not_straddle_zero(self) -> None:
+        from tradingbot.backtest.engine import bootstrap_expectancy
+
+        stats = bootstrap_expectancy(self._r(40, 20))
+        assert stats is not None
+        assert stats["straddles_zero"] is False
+        assert stats["ci_low_r"] > 0
+        assert stats["prob_positive"] > 0.95
+
+    def test_a_clear_loser_is_reliably_negative(self) -> None:
+        from tradingbot.backtest.engine import bootstrap_expectancy
+
+        stats = bootstrap_expectancy(self._r(5, 45))
+        assert stats is not None
+        assert stats["ci_high_r"] < 0
+        assert stats["prob_positive"] < 0.05
+
+    def test_the_interval_is_reproducible(self) -> None:
+        """A backtest reporting different confidence each run is worthless."""
+        from tradingbot.backtest.engine import bootstrap_expectancy
+
+        sample = self._r(18, 22)
+        assert bootstrap_expectancy(sample) == bootstrap_expectancy(sample)
+
+    def test_more_trades_narrow_the_interval(self) -> None:
+        """The only honest way to turn a hint into evidence."""
+        from tradingbot.backtest.engine import bootstrap_expectancy
+
+        small = bootstrap_expectancy(self._r(12, 18))
+        large = bootstrap_expectancy(self._r(120, 180))
+        assert small is not None and large is not None
+        small_width = small["ci_high_r"] - small["ci_low_r"]
+        large_width = large["ci_high_r"] - large["ci_low_r"]
+        assert large_width < small_width
+
+
+class TestWalkForward:
+    """Whether a result held across the period or came from one stretch."""
+
+    def _trade(self, day: int, r: str):
+        """A resolved trade whose r_multiple is exactly `r`."""
+        from tradingbot.backtest.engine import SimulatedTrade
+
+        risk = Decimal("1")
+        pnl = Decimal(r) * risk
+        return SimulatedTrade(
+            symbol="TESTUSDT",
+            side=Side.LONG,
+            decision_bar=BAR + dt.timedelta(days=day),
+            entry=Decimal("100"),
+            stop=Decimal("99"),
+            target=Decimal("103"),
+            quantity=Decimal("1"),
+            risk_amount=risk,
+            outcome=TradeOutcome.TARGET,
+            fill_bar=BAR + dt.timedelta(days=day),
+            exit_bar=BAR + dt.timedelta(days=day),
+            exit_price=Decimal("100") + pnl,
+            friction=Decimal("0"),
+        )
+
+    def test_splits_by_time_not_by_trade_count(self) -> None:
+        from tradingbot.backtest.engine import walk_forward
+
+        # Eight trades over 80 days, all in the first and last quarters.
+        trades = [self._trade(d, "1") for d in (0, 5, 10, 15)]
+        trades += [self._trade(d, "1") for d in (65, 70, 75, 80)]
+        windows = walk_forward(trades, windows=4)
+
+        assert len(windows) == 4
+        assert windows[0]["trades"] == 4
+        assert windows[1]["trades"] == 0   # a genuinely empty period
+        assert windows[3]["trades"] == 4
+
+    def test_exposes_an_edge_concentrated_in_one_window(self) -> None:
+        """The most common false positive: three bad windows and one great one.
+
+        Aggregate expectancy here is positive, and the windows show why that
+        is not a strategy.
+        """
+        from tradingbot.backtest.engine import walk_forward
+
+        trades = [self._trade(d, "-0.5") for d in (0, 5, 10, 20, 25, 30, 40, 45, 50)]
+        trades += [self._trade(d, "6") for d in (62, 68, 74)]
+        windows = walk_forward(trades, windows=4)
+
+        positive = [w for w in windows if (w["expectancy_r"] or 0) > 0]
+        assert len(positive) == 1
+        assert positive[0]["window"] == 4
+        # The aggregate hides it.
+        total = sum(float(w["total_r"]) for w in windows)
+        assert total > 0
+
+    def test_too_few_trades_returns_no_windows(self) -> None:
+        from tradingbot.backtest.engine import walk_forward
+
+        assert walk_forward([self._trade(0, "1"), self._trade(5, "1")]) == []

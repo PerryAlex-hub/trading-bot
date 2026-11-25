@@ -30,6 +30,7 @@ the result optimistic at the margin, and each is noted where it bites.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -39,6 +40,7 @@ import pandas as pd
 
 from ..analysis.pipeline import MIN_BARS_FOR_ANALYSIS, SymbolData, analyse_universe
 from ..config import RiskConfig, Universe
+from ..jobs.analyze import BARS_TO_LOAD
 from ..models import PositionSize, Side, Tier, Timeframe, TradeSetup
 from ..risk.gate import PortfolioState, RiskGate
 from ..risk.sizing import friction_cost
@@ -133,6 +135,8 @@ def run_backtest(
     max_wait_bars: int = 3,
     max_hold_bars: int = 30,
     equity: Decimal | None = None,
+    stride: int = 1,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> BacktestResult:
     """Replay every decision bar in the stored history.
 
@@ -148,6 +152,15 @@ def run_backtest(
     `max_hold_bars` closes a position that has gone nowhere, at the close. Real
     money would not sit in a 4h trade for a month; counting it as open forever
     would flatter the result by deferring every loss.
+
+    `stride` analyses every Nth bar instead of every bar. The full pipeline
+    costs roughly 80ms per symbol per bar, so five symbols over 3,000 bars is
+    around 20 minutes of honest work - there is no shortcut that keeps the
+    replay faithful, since the indicators genuinely have to be recomputed on
+    each truncated series. A stride of 4 or 6 gives a usable first read in a
+    few minutes at the cost of missing setups that appeared and expired between
+    sampled bars, so it understates signal count and should not be used for a
+    final number.
     """
     result = BacktestResult()
     gate = RiskGate(risk_config)
@@ -169,9 +182,13 @@ def run_backtest(
     # One open trade per symbol at a time, mirroring max_per_base_asset.
     open_until: dict[str, int] = {}
 
-    for position in range(first, len(index) - 1):
+    positions = range(first, len(index) - 1, max(1, stride))
+    total = len(positions)
+    for step, position in enumerate(positions):
         bar_time = index[position]
         result.bars_examined += 1
+        if on_progress is not None and (step % 25 == 0 or step == total - 1):
+            on_progress(step + 1, total)
 
         payloads = _slice_universe(
             candles_by_symbol, universe, bar_time, primary_key
@@ -385,7 +402,119 @@ def summarise(result: BacktestResult) -> dict[str, object]:
         "signals_rejected": result.signals_rejected,
         "bars_examined": result.bars_examined,
         "top_vetoes": _top_vetoes(result),
+        # How much of the above could be luck, and whether the result held
+        # across the whole period or came from one stretch of it.
+        "inference": bootstrap_expectancy(r_values),
+        "windows": walk_forward(result.trades),
     }
+
+
+# Fixed so the same trades always produce the same interval. A backtest that
+# reported a different confidence on each run would be worth less than one
+# that reported none.
+_BOOTSTRAP_SEED = 20261125
+_BOOTSTRAP_ITERATIONS = 4000
+# Below this, the interval is so wide that quoting it invites false confidence.
+MIN_TRADES_FOR_INFERENCE = 20
+
+
+def bootstrap_expectancy(
+    r_values: list[Decimal],
+    *,
+    iterations: int = _BOOTSTRAP_ITERATIONS,
+    confidence: float = 0.95,
+) -> dict[str, object] | None:
+    """A confidence interval on mean R, and the odds the edge is real.
+
+    This exists because a single expectancy figure is the most dangerous
+    number this project produces. "+0.14R per trade" over 15 trades and over
+    1,500 trades read identically and mean completely different things, and the
+    first is almost certainly noise.
+
+    Resampling the trades with replacement asks: if this strategy were run
+    again on draws from the same distribution of outcomes, how often would it
+    make money? `prob_positive` is that fraction. It is NOT a probability that
+    the strategy works in future - the sample cannot speak to regimes it never
+    saw - it is a measure of how much of the observed result could be luck.
+
+    Returns None below `MIN_TRADES_FOR_INFERENCE`, because an interval computed
+    from a dozen trades spans every conclusion and reporting it would dress
+    noise as evidence.
+    """
+    if len(r_values) < MIN_TRADES_FOR_INFERENCE:
+        return None
+
+    import numpy as np
+
+    sample = np.array([float(v) for v in r_values], dtype=float)
+    rng = np.random.default_rng(_BOOTSTRAP_SEED)
+    means = sample[
+        rng.integers(0, len(sample), size=(iterations, len(sample)))
+    ].mean(axis=1)
+
+    tail = (1.0 - confidence) / 2.0
+    low, high = np.quantile(means, [tail, 1.0 - tail])
+    return {
+        "expectancy_r": round(float(sample.mean()), 4),
+        "ci_low_r": round(float(low), 4),
+        "ci_high_r": round(float(high), 4),
+        "prob_positive": round(float((means > 0).mean()), 3),
+        "straddles_zero": bool(low <= 0 <= high),
+        "trades": len(sample),
+    }
+
+
+def walk_forward(
+    trades: list[SimulatedTrade], *, windows: int = 4
+) -> list[dict[str, object]]:
+    """Expectancy per equal slice of the replay, oldest first.
+
+    A single number across 540 days hides the thing most likely to be true: an
+    edge that existed in one regime and not the others. If three windows are
+    negative and the fourth carries the whole result, that is not a strategy,
+    it is one lucky stretch - and the aggregate expectancy will cheerfully
+    report a positive edge anyway.
+
+    Split by time rather than by position in the list, so each window is a
+    period rather than a count of trades.
+    """
+    resolved = sorted(
+        (t for t in trades if t.resolved and t.r_multiple is not None),
+        key=lambda t: t.decision_bar,
+    )
+    if len(resolved) < windows * 2:
+        return []
+
+    first = resolved[0].decision_bar
+    last = resolved[-1].decision_bar
+    span = (last - first) / windows if last > first else None
+    if span is None:
+        return []
+
+    out: list[dict[str, object]] = []
+    for index in range(windows):
+        start = first + span * index
+        end = first + span * (index + 1)
+        bucket = [
+            t for t in resolved
+            if (t.decision_bar >= start and t.decision_bar < end)
+            or (index == windows - 1 and t.decision_bar == last)
+        ]
+        r_values = [t.r_multiple for t in bucket if t.r_multiple is not None]
+        total = sum(r_values, Decimal("0"))
+        out.append(
+            {
+                "window": index + 1,
+                "from": start,
+                "to": end,
+                "trades": len(bucket),
+                "total_r": round(float(total), 3),
+                "expectancy_r": (
+                    round(float(total / len(r_values)), 4) if r_values else None
+                ),
+            }
+        )
+    return out
 
 
 def _max_drawdown_r(r_values: list[Decimal]) -> Decimal:
@@ -478,11 +607,28 @@ def _slice_universe(
     return payloads
 
 
-def _slice(frame: pd.DataFrame | None, bar_time: datetime) -> pd.DataFrame | None:
-    """Everything up to and including `bar_time`. The no-lookahead guarantee."""
+def _slice(
+    frame: pd.DataFrame | None, bar_time: datetime, lookback: int = BARS_TO_LOAD
+) -> pd.DataFrame | None:
+    """The last `lookback` bars up to and including `bar_time`.
+
+    The upper bound is the no-lookahead guarantee. The lower bound matters for
+    two reasons, and the second is the important one:
+
+    * Speed. Without it the replay is quadratic - by bar 3,000 it recomputes
+      every indicator over 3,000 rows, for every symbol, on every bar. A 1,400
+      bar synthetic run took over ten minutes; the live history is longer.
+    * Fidelity. The live job loads exactly `BARS_TO_LOAD` bars
+      (`repo.latest(..., limit=BARS_TO_LOAD)`), so a replay that hands the
+      analysis an unbounded series is not replaying the live system. Any
+      indicator whose value depends on how much history precedes it - and a
+      200-EMA warm-up does - would be computed differently here than in
+      production, which is the one thing a backtester must never do.
+    """
     if frame is None or frame.empty:
         return None
-    return frame.loc[frame.index <= bar_time]
+    visible = frame.loc[frame.index <= bar_time]
+    return visible.iloc[-lookback:] if len(visible) > lookback else visible
 
 
 def _position_of(frame: pd.DataFrame, when: datetime | None) -> int | None:

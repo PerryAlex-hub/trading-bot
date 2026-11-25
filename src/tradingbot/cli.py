@@ -25,6 +25,14 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
 from .settings import configure_logging, get_settings
@@ -367,6 +375,14 @@ def backtest(
     max_wait: int = typer.Option(3, "--max-wait", help="Bars a limit entry may rest"),
     max_hold: int = typer.Option(30, "--max-hold", help="Bars before a trade is timed out"),
     show_trades: int = typer.Option(10, "--show-trades", help="How many trades to list"),
+    stride: int = typer.Option(
+        1,
+        "--stride",
+        help=(
+            "Analyse every Nth bar. 1 is faithful and slow (~80ms per symbol "
+            "per bar); 4-6 gives a first read in minutes but undercounts signals."
+        ),
+    ),
 ) -> None:
     """Replay stored candles through the real decision path.
 
@@ -377,7 +393,7 @@ def backtest(
     from typing import Any
 
     from .analysis.frame import to_frame
-    from .backtest import run_backtest, summarise
+    from .backtest import MIN_TRADES_FOR_INFERENCE, run_backtest, summarise
     from .config import load_risk, load_universe
     from .db.engine import session_scope
     from .db.repo import CandleRepo
@@ -415,15 +431,37 @@ def backtest(
         console.print("[red]No stored candles.[/red] Run `tradingbot ingest` first.")
         raise typer.Exit(code=1)
 
-    console.print("\n[bold]Replaying[/bold] (recomputing indicators per bar; this is slow)")
-    result = run_backtest(
-        candles_by_symbol=candles,
-        universe=universe,
-        risk_config=risk,
-        primary=Timeframe(universe.primary_timeframe),
-        max_wait_bars=max_wait,
-        max_hold_bars=max_hold,
+    console.print(
+        f"\n[bold]Replaying[/bold] stride={stride}, recomputing indicators per bar. "
+        "Expect roughly 80ms per symbol per bar - minutes to tens of minutes."
     )
+
+    # A silent forty-minute command is indistinguishable from a hung one, and
+    # the natural reaction is to kill it and conclude the tool is broken.
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} bars"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("replaying", total=None)
+
+        def report(done: int, total: int) -> None:
+            progress.update(task, completed=done, total=total)
+
+        result = run_backtest(
+            candles_by_symbol=candles,
+            universe=universe,
+            risk_config=risk,
+            primary=Timeframe(universe.primary_timeframe),
+            max_wait_bars=max_wait,
+            max_hold_bars=max_hold,
+            stride=stride,
+            on_progress=report,
+        )
     stats = summarise(result)
 
     for error in result.errors[:5]:
@@ -458,19 +496,66 @@ def backtest(
                 f"{f'{float(r):+.2f}R' if r is not None else 'n/a':>8}"
             )
 
-    expectancy = stats.get("expectancy_r")
-    if isinstance(expectancy, float):
-        if expectancy > 0:
+    # Walk-forward before the verdict, because a positive aggregate built from
+    # one good stretch is the most common false positive in this whole
+    # exercise, and seeing the windows first makes it obvious.
+    windows = stats.get("windows")
+    if windows:
+        console.print("\n[bold]Walk-forward[/bold] (did the edge hold, or was it one stretch?)")
+        for window in windows:  # type: ignore[union-attr]
+            expectancy = window["expectancy_r"]
+            shown = f"{expectancy:+.3f}R" if expectancy is not None else "no trades"
+            colour = "green" if (expectancy or 0) > 0 else "yellow"
             console.print(
-                f"\n[green]Positive expectancy: {expectancy:+.4f}R per trade[/green] "
-                f"over {stats['trades']} trades. Treat it as a hypothesis until "
-                "forward testing agrees."
+                f"  {window['from']:%Y-%m-%d} to {window['to']:%Y-%m-%d}  "
+                f"{window['trades']:>4} trades  [{colour}]{shown:>9}[/{colour}]"
+            )
+        positive = sum(1 for w in windows if (w["expectancy_r"] or 0) > 0)  # type: ignore[union-attr]
+        if positive and positive < len(windows):  # type: ignore[arg-type]
+            console.print(
+                f"  [dim]{positive} of {len(windows)} windows positive - an edge "  # type: ignore[arg-type]
+                "concentrated in part of the period is a regime, not a strategy[/dim]"
+            )
+
+    inference = stats.get("inference")
+    expectancy = stats.get("expectancy_r")
+
+    if inference is None and isinstance(expectancy, float):
+        console.print(
+            f"\n[yellow]Expectancy {expectancy:+.4f}R over {stats['trades']} "
+            f"trades.[/yellow] Below {MIN_TRADES_FOR_INFERENCE} trades there is no "
+            "honest confidence interval to quote, so this number is a hint about "
+            "plumbing, not evidence about edge. It is not yet a result."
+        )
+    elif isinstance(inference, dict):
+        low, high = inference["ci_low_r"], inference["ci_high_r"]
+        probability = inference["prob_positive"]
+        console.print(
+            f"\n[bold]Expectancy {inference['expectancy_r']:+.4f}R[/bold] per trade "
+            f"over {inference['trades']} trades"
+        )
+        console.print(
+            f"  95% interval  {low:+.4f}R to {high:+.4f}R\n"
+            f"  resamples profitable  {probability:.1%}"
+        )
+        if inference["straddles_zero"]:
+            console.print(
+                "  [yellow]The interval contains zero, so this result is not "
+                "distinguishable from no edge at all.[/yellow] More trades would "
+                "narrow it; tuning the strategy against this sample would just "
+                "fit the noise."
+            )
+        elif high < 0:
+            console.print(
+                "  [yellow]Reliably negative.[/yellow] Win rate is not the thing "
+                "to chase - look at stop placement and at which factors carry "
+                "the losing trades."
             )
         else:
             console.print(
-                f"\n[yellow]Negative expectancy: {expectancy:+.4f}R per trade[/yellow] "
-                f"over {stats['trades']} trades. The win rate is not the problem "
-                "to chase; the setup or the stop placement is."
+                "  [green]Reliably positive on this sample.[/green] Still a "
+                "hypothesis: the replay cannot see regimes it never covered, and "
+                "forward testing is the only check that counts."
             )
 
 

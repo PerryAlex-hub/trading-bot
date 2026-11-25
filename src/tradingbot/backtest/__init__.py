@@ -12,17 +12,23 @@ first change to either.
 """
 
 from .engine import (
+    MIN_TRADES_FOR_INFERENCE,
     BacktestResult,
     SimulatedTrade,
     TradeOutcome,
+    bootstrap_expectancy,
     run_backtest,
     summarise,
+    walk_forward,
 )
 
 __all__ = [
+    "MIN_TRADES_FOR_INFERENCE",
     "BacktestResult",
     "SimulatedTrade",
     "TradeOutcome",
+    "bootstrap_expectancy",
     "run_backtest",
     "summarise",
+    "walk_forward",
 ]
