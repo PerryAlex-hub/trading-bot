@@ -37,7 +37,25 @@ portfolio:
   max_satellite_positions: 1
   # Crypto majors correlate 0.8+ in trends and ~0.95 in a crash. Positions are
   # weighted by beta-to-BTC so the book cannot become one disguised BTC bet.
-  max_portfolio_btc_beta: 2.0
+  #
+  # Raised from 2.0 to 3.0 after watching it in production. At 2.0, one open
+  # BTC position (beta 1.0) left a budget of 1.0, which only XRPUSDT fits - so
+  # SOL, DOGE and PEPE were all vetoed on beta while a BTC trade was open, and
+  # max_open_positions: 2 was unreachable for four of five symbols. A live run
+  # rejected SOL at 2.50 and DOGE at 2.80 for exactly this reason.
+  #
+  # The argument for the change: at 2.0 this rule was double-counting risk the
+  # per-trade budget already bounds. Risk per trade is 0.25-0.5% of equity,
+  # enforced by the stop, so two concurrent positions is a worst case near 1% -
+  # well inside the 3% daily-loss breaker. The beta cap exists to stop
+  # CORRELATED simultaneous losses, not to re-cap the loss itself, and holding
+  # both tight made the bot a one-position system that gathers evidence at a
+  # quarter of the rate.
+  #
+  # At 3.0: BTC+XRP (2.0), BTC+SOL (2.5) and BTC+DOGE (2.8) are all permitted,
+  # while anything plus PEPE (2.0) still leaves no room for a third. The
+  # per-trade stop remains the thing doing the real work.
+  max_portfolio_btc_beta: 3.0
   beta_to_btc:
     BTCUSDT: 1.0
     ETHUSDT: 1.1

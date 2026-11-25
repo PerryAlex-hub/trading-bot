@@ -402,23 +402,55 @@ class TestConfigCoherence:
             "even on an empty book. Lower the beta, raise the cap, or remove them."
         )
 
-    def test_at_most_one_symbol_sits_exactly_on_the_cap(self, risk_config) -> None:
-        """A symbol at exactly the cap is tradeable only alone.
+    def test_a_second_position_alongside_btc_is_actually_reachable(
+        self, risk_config
+    ) -> None:
+        """max_open_positions: 2 must not be unreachable in practice.
 
-        Not an error - 2.0 for a memecoin is honest - but worth knowing, since
-        it makes max_open_positions unreachable while that symbol is held.
+        At the original cap of 2.0 an open BTC position left a budget of 1.0,
+        so only XRPUSDT fitted and the other three satellites were vetoed on
+        beta whenever a BTC trade was open. A live run rejected SOLUSDT at 2.50
+        and DOGEUSDT at 2.80 for precisely that reason, which made the bot a
+        one-position system while still advertising two.
+
+        The assertion is deliberately about capability rather than a specific
+        number: if the cap is tightened again, this fails and says why.
         """
         from tradingbot.config import load_universe
 
-        cap = risk_config.decimal("portfolio", "max_portfolio_btc_beta", default="2.0")
-        at_cap = [
+        cap = risk_config.decimal("portfolio", "max_portfolio_btc_beta", default="3.0")
+        btc = risk_config.beta_to_btc("BTCUSDT")
+        fits = [
             config.symbol
-            for config in load_universe().symbols
-            if config.tier.tradeable and risk_config.beta_to_btc(config.symbol) == cap
+            for config in load_universe().tradeable()
+            if config.symbol != "BTCUSDT"
+            and btc + risk_config.beta_to_btc(config.symbol) <= cap
         ]
-        assert at_cap == ["PEPEUSDT"], (
-            f"symbols sitting exactly on the beta cap changed: {at_cap}. Each one "
-            "can only be held alone; update this test and the README note."
+        assert len(fits) >= 3, (
+            f"only {fits} can be held alongside BTC under a cap of {cap}. "
+            "max_open_positions is effectively 1 for everything else; raise the "
+            "cap or lower the satellite betas."
+        )
+
+    def test_the_cap_still_refuses_three_satellites(self, risk_config) -> None:
+        """Raising the cap must not have made it decorative.
+
+        The rule exists to stop the book becoming several correlated BTC bets,
+        so there has to be a combination it still refuses.
+        """
+        from tradingbot.config import load_universe
+
+        cap = risk_config.decimal("portfolio", "max_portfolio_btc_beta", default="3.0")
+        satellites = [
+            risk_config.beta_to_btc(config.symbol)
+            for config in load_universe().tradeable()
+            if config.tier is Tier.SATELLITE
+        ]
+        assert len(satellites) >= 3
+        worst_three = sum(sorted(satellites, reverse=True)[:3])
+        assert worst_three > cap, (
+            f"the three highest-beta satellites total {worst_three}, which fits "
+            f"under the cap of {cap}. The correlation rule no longer binds."
         )
 
 

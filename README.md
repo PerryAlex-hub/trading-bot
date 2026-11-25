@@ -356,34 +356,52 @@ cent. Leverage then reduces the *margin* against that notional, not the notional
 itself. `tradingbot minimums` ranks every contract by this, and
 `ContractSpec.min_cost()` computes it per pair from live data.
 
-## The beta cap, and what it still constrains
+## The beta cap, and why it was raised
 
-`risk.yaml` caps total beta-weighted exposure in one direction at 2.0, which is
-the rule that stops the book becoming three correlated BTC bets in different
-tickers.
+`risk.yaml` caps total beta-weighted exposure in one direction, which is the
+rule that stops the book becoming several correlated BTC bets in different
+tickers. Majors run 0.8+ correlation to BTC in trends and about 0.95 in a
+crash, so "five symbols" is not five independent positions.
 
-| Symbol | `beta_to_btc` | `max_portfolio_btc_beta` | Result |
-|---|---|---|---|
-| BTCUSDT | 1.0 | 2.0 | fine |
-| XRPUSDT | 1.0 | 2.0 | fine |
-| SOLUSDT | 1.5 | 2.0 | fine |
-| DOGEUSDT | 1.8 | 2.0 | fine |
-| PEPEUSDT | 2.0 | 2.0 | tradeable only alone |
+The cap was **2.0**, and production showed that number was wrong. With one BTC
+position open (beta 1.0) the remaining budget was 1.0, which only XRPUSDT
+fits - so a live run rejected SOLUSDT at 2.50 and DOGEUSDT at 2.80 on beta
+while a BTC short sat open. `max_open_positions: 2` was unreachable for four
+of five symbols: the bot advertised two positions and was structurally
+incapable of holding them.
 
-This table used to carry two rows marked **never tradeable**: GOATUSDT and
-AXISUSDT both had beta 2.5 against a 2.0 cap, so each exceeded the entire
-budget by itself and the gate vetoed them on an empty book. They were removed,
+It is now **3.0**, on the argument that at 2.0 the rule was double-counting
+risk the per-trade budget already bounds. Risk per trade is 0.25-0.5% of
+equity, enforced by the stop, so two concurrent positions is a worst case near
+1% - well inside the 3% daily-loss breaker. The beta cap exists to stop
+correlated *simultaneous* losses, not to re-cap the size of the loss itself.
+Holding both tight made the bot gather evidence at a quarter of the rate, which
+for a system whose whole problem is a journal with nothing in it was the more
+expensive risk.
+
+With one BTC position open, at a cap of 3.0:
+
+| Second position | Combined beta | Result |
+|---|---|---|
+| XRPUSDT | 2.0 | permitted |
+| SOLUSDT | 2.5 | permitted |
+| DOGEUSDT | 2.8 | permitted |
+| PEPEUSDT | 3.0 | permitted, exactly at the cap |
+
+And the rule still binds where it should: the three highest-beta satellites
+total **4.8**, so no combination of three is possible, and PEPE at the cap
+leaves no room for a third position at all. Two tests pin both halves - that a
+second position is reachable, and that three satellites are still refused -
+so tightening the cap again fails loudly rather than quietly returning the bot
+to one position.
+
+This table previously carried two rows marked **never tradeable**: GOATUSDT and
+AXISUSDT both had beta 2.5 against the old 2.0 cap, so each exceeded the whole
+budget by itself and the gate vetoed them on an empty book. Both were removed,
 for a second and independent reason as well - neither is listed on the data
 venue, so they ingested nothing on every run and produced no signals even
 before the gate saw them. Two defects pointing the same way is usually the
 answer.
-
-What remains: **no two symbols can be held in the same direction if their
-combined beta exceeds 2.0**, so `max_open_positions: 2` is reachable only for
-pairs like XRP + BTC, and PEPE at exactly 2.0 can only be held alone. That is
-a deliberate constraint rather than a bug, and a test pins both facts so a
-config change is noticed. If you want two same-direction satellites, raise the
-cap to ~3.0 and accept the correlated drawdown that permits.
 
 ### A second config implication
 
