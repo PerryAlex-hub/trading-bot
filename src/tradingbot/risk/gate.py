@@ -171,14 +171,20 @@ class RiskGate:
                     "so the liquidity floor could not be checked"
                 )
             elif quote_volume_24h < minimum_volume:
-                shortfall = minimum_volume / quote_volume_24h if quote_volume_24h > 0 else None
-                detail = (
-                    f"24h quote volume {quote_volume_24h:,.0f} is below the "
-                    f"{minimum_volume:,.0f} floor"
+                # Reported as a percentage of the floor rather than a multiple.
+                # The multiple was formatted to whole numbers and rendered a
+                # genuine 1.43x shortfall as "(1x short)", which reads as "it
+                # is fine" - the opposite of the message. A near miss and a 37x
+                # miss call for different responses, so the number has to
+                # distinguish them.
+                reached = quote_volume_24h / minimum_volume * Decimal("100")
+                vetoes.append(
+                    RiskVeto(
+                        "gates.min_24h_quote_volume",
+                        f"24h quote volume {quote_volume_24h:,.0f} is "
+                        f"{reached:.0f}% of the {minimum_volume:,.0f} floor",
+                    )
                 )
-                if shortfall is not None:
-                    detail += f" ({shortfall:.0f}x short)"
-                vetoes.append(RiskVeto("gates.min_24h_quote_volume", detail))
 
         # --- 3. Portfolio limits -----------------------------------------
         vetoes.extend(

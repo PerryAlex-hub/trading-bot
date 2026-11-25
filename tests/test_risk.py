@@ -507,8 +507,33 @@ class TestLiquidityFloor:
         )
         # The number belongs in the message: "too thin" is not reviewable.
         assert "800,000" in veto.detail
-        # 30,000,000 / 800,000 = 37.5, which formats as 38.
-        assert "38x short" in veto.detail
+        # Reported as a share of the floor, not a multiple. A multiple rounded
+        # to whole numbers rendered a real 1.43x shortfall as "(1x short)",
+        # which reads as approval.
+        assert "3% of the 30,000,000 floor" in veto.detail
+
+    def test_a_near_miss_is_distinguishable_from_a_gross_one(
+        self, risk_config, btc_spec, btc_long
+    ) -> None:
+        """DOGEUSDT's real figure: 20.9M against a 30M floor.
+
+        The old wording collapsed this to "(1x short)" - indistinguishable
+        from passing, and from a 37x miss. The two need different responses:
+        one is a symbol to watch, the other is a symbol to drop.
+        """
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("10000")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+            quote_volume_24h=Decimal("20908936"),
+        )
+        veto = next(
+            v for v in decision.vetoes if v.rule == "gates.min_24h_quote_volume"
+        )
+        assert "70% of the 30,000,000 floor" in veto.detail
 
     def test_a_deep_book_passes(self, risk_config, btc_spec, btc_long) -> None:
         decision = RiskGate(risk_config).evaluate(

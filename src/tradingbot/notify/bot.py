@@ -381,13 +381,34 @@ class TelegramBot:
         days = _int_arg(command.args, default=90, maximum=3650)
         since = datetime.now(tz=UTC) - timedelta(days=days)
         with session_scope() as session:
-            closed = PositionRepo(session).closed_since(since)
+            repo = PositionRepo(session)
+            closed = repo.closed_since(since)
+            open_count = len(repo.open_positions())
 
         if not closed:
-            return (
-                f"No trades resolved in the last {days} days.\n\n"
-                "_Paper tracking only records trades when_ `TRADING_MODE=paper`_._"
-            )
+            # The old reply blamed TRADING_MODE unconditionally, which was
+            # actively misleading: the observed case had paper mode ON and a
+            # position already open and tracked, so the one explanation given
+            # was the one that could not be true. Distinguish "tracking is off"
+            # from "tracking is on and nothing has closed yet" - the second is
+            # the normal state of a 4h strategy in its first week.
+            lines = [f"No trades resolved in the last {days} days."]
+            if open_count:
+                lines += [
+                    "",
+                    f"`{open_count}` position(s) are open and being tracked. "
+                    "Results appear here once they hit a target or a stop - on "
+                    "the 4h timeframe that is usually days, not hours.",
+                    "",
+                    "_Use_ `/positions` _to see them now._",
+                ]
+            else:
+                lines += [
+                    "",
+                    "Nothing is open either. Tracking records trades only when "
+                    "`TRADING_MODE=paper`; check `/status` for the active mode.",
+                ]
+            return "\n".join(lines)
 
         wins = [p for p in closed if (p.realised_pnl or 0) > 0]
         losses = [p for p in closed if (p.realised_pnl or 0) <= 0]
