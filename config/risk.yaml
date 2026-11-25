@@ -92,16 +92,28 @@ circuit_breakers:
 gates:
   # Satellite/paper promotion requirements, checked against stored data.
   min_history_days: 90
-  # Liquidity floor, in quote currency. ENFORCED as of this change: the gate
-  # computes 24h traded value from stored candles (volume x close per bar) and
-  # vetoes below this. It previously sat here unread, which is how a symbol
-  # with 0.8M of daily volume survived in the universe against this 30M floor
-  # until it was measured by hand. Set to 0 to disable.
+  # Liquidity floor, in quote currency. ENFORCED: the gate computes 24h traded
+  # value from stored candles (volume x close per bar) and vetoes below this.
+  # It previously sat here unread, which is how a symbol with 0.8M of daily
+  # volume survived in the universe until it was measured by hand. Set to 0 to
+  # disable.
+  #
+  # Lowered from 30M to 15M. The 30M figure was chosen before anyone had
+  # measured this market: only twelve pairs on all of Binance currently clear
+  # 50M of 24h volume, and the floor was vetoing DOGEUSDT at 20.9M - a symbol
+  # with 419,000 trades a day, the second most actively traded name in the
+  # universe. That is not an illiquid book, it is a floor calibrated for a
+  # busier market than the one being traded.
+  #
+  # 15M still refuses the case this rule exists for: NILUSDT at 0.8M, which is
+  # 5% of the floor, was removed from the universe for exactly this reason.
+  # Revisit upward if volumes recover - a floor that never binds is the dead
+  # config this rule used to be.
   #
   # Measured from stored candles, which are Binance's, not WEEX's. Binance is
   # the deeper venue, so this is the optimistic reading: a book too thin here
   # is certainly too thin where the trade would actually go.
-  min_24h_quote_volume: 30000000
+  min_24h_quote_volume: 15000000
 
 venue:
   # Assumed minimum order value when the live contract spec is unavailable

@@ -530,7 +530,7 @@ class TestLiquidityFloor:
             spec=btc_spec,
             quote=quote("BTCUSDT", "91995", "92005", "92000"),
             funding=FundingInfo("BTCUSDT", Decimal("0.005")),
-            # NILUSDT's measured figure against a 30,000,000 floor.
+            # NILUSDT's measured figure, the case this rule exists for.
             quote_volume_24h=Decimal("800000"),
         )
         assert not decision.approved
@@ -542,16 +542,39 @@ class TestLiquidityFloor:
         # Reported as a share of the floor, not a multiple. A multiple rounded
         # to whole numbers rendered a real 1.43x shortfall as "(1x short)",
         # which reads as approval.
-        assert "3% of the 30,000,000 floor" in veto.detail
+        assert "5% of the 15,000,000 floor" in veto.detail
 
     def test_a_near_miss_is_distinguishable_from_a_gross_one(
         self, risk_config, btc_spec, btc_long
     ) -> None:
-        """DOGEUSDT's real figure: 20.9M against a 30M floor.
+        """A symbol just under the floor must not read like a gross failure.
 
-        The old wording collapsed this to "(1x short)" - indistinguishable
-        from passing, and from a 37x miss. The two need different responses:
-        one is a symbol to watch, the other is a symbol to drop.
+        The old wording collapsed every shortfall to "(1x short)", so a 1.4x
+        miss and a 37x miss were indistinguishable from each other and from
+        passing. They call for opposite responses: one is a symbol to watch,
+        the other is a symbol to drop.
+        """
+        decision = RiskGate(risk_config).evaluate(
+            btc_long,
+            tier=Tier.CORE,
+            portfolio=PortfolioState(equity=Decimal("10000")),
+            spec=btc_spec,
+            quote=quote("BTCUSDT", "91995", "92005", "92000"),
+            funding=FundingInfo("BTCUSDT", Decimal("0.005")),
+            quote_volume_24h=Decimal("12000000"),
+        )
+        veto = next(
+            v for v in decision.vetoes if v.rule == "gates.min_24h_quote_volume"
+        )
+        assert "80% of the 15,000,000 floor" in veto.detail
+
+    def test_doge_clears_the_lowered_floor(self, risk_config, btc_spec, btc_long) -> None:
+        """The reason the floor was lowered, pinned so it is not undone blindly.
+
+        DOGEUSDT measured 20.9M of 24h volume across 419,000 trades and was
+        vetoed by a 30M floor - a floor calibrated for a busier market than
+        the one being traded, since only twelve pairs on Binance currently
+        clear 50M at all.
         """
         decision = RiskGate(risk_config).evaluate(
             btc_long,
@@ -562,10 +585,9 @@ class TestLiquidityFloor:
             funding=FundingInfo("BTCUSDT", Decimal("0.005")),
             quote_volume_24h=Decimal("20908936"),
         )
-        veto = next(
-            v for v in decision.vetoes if v.rule == "gates.min_24h_quote_volume"
-        )
-        assert "70% of the 30,000,000 floor" in veto.detail
+        assert not any(
+            v.rule == "gates.min_24h_quote_volume" for v in decision.vetoes
+        ), "DOGEUSDT's measured volume should clear the floor after the change"
 
     def test_a_deep_book_passes(self, risk_config, btc_spec, btc_long) -> None:
         decision = RiskGate(risk_config).evaluate(
